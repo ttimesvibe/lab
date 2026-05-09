@@ -1,0 +1,17 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="referrer" content="strict-origin-when-cross-origin" />
+  <title>lab — fresh v2</title>
+</head>
+<body>
+  <div id="root"></div>
+  <!--
+    vite build 가 src/main.jsx 를 진입점으로 dist/assets/index_build-*.js 생성.
+    docs/build.js 가 dist/index.html → docs/index.html 복사 + drift guard 양방향.
+  -->
+  <script type="module" src="/src/main.jsx"></script>
+</body>
+</html>

@@ -1,0 +1,67 @@
+#!/bin/sh
+# lab fresh v2 pre-push hook
+# 책임: drift guard 양방향 + 단위 테스트 통과 + canonical URL 검증
+# 사료: editor/ops/lab-v2-fresh-2026-05-09.md (S5.1 A14.4)
+
+set -e
+
+# Canonical (lab 전용)
+CANONICAL_URL="https://lab.ttimes.workers.dev"
+
+# Forbidden URLs (prod / 옛 test / 옛 worker 잔존 차단)
+# 정규식 OR 패턴
+FORBIDDEN_REGEX='alleditor\.ttimes6000\.workers\.dev|ttimes-edit\.ttimes\.workers\.dev|editor\.ttimes\.workers\.dev'
+
+# 1. config.js 의 workerUrl 이 canonical 인지
+if [ -f docs/src/utils/config.js ]; then
+  if ! grep -q "$CANONICAL_URL" docs/src/utils/config.js; then
+    echo "❌ pre-push: config.js workerUrl ≠ canonical ($CANONICAL_URL)"
+    echo "   docs/src/utils/config.js 의 DEFAULT_CONFIG.workerUrl 확인"
+    exit 1
+  fi
+fi
+
+# 2. build.js 의 CANONICAL_WORKER_URL 도 같은 값인지
+if [ -f docs/build.js ]; then
+  if ! grep -q "$CANONICAL_URL" docs/build.js; then
+    echo "❌ pre-push: build.js CANONICAL_WORKER_URL ≠ $CANONICAL_URL"
+    echo "   docs/build.js 와 docs/src/utils/config.js 양쪽 동시 수정 의무"
+    exit 1
+  fi
+fi
+
+# 3. docs/dist + docs/assets 안 forbidden URL 잔존 차단
+for dir in docs/dist docs/assets; do
+  if [ -d "$dir" ]; then
+    if grep -rEH "$FORBIDDEN_REGEX" "$dir" 2>/dev/null; then
+      echo ""
+      echo "❌ pre-push: forbidden URL 잔존 — push 차단"
+      echo "   prod URL (alleditor.ttimes6000.workers.dev) 또는 옛 test URL (editor.ttimes.workers.dev) 가 lab 빌드 번들에 박혀있음"
+      echo "   대응: cd docs && npm run build (drift guard 가 자동 차단함)"
+      exit 1
+    fi
+  fi
+done
+
+# 4. 단위 테스트 통과 검증 (worker/__tests__ 가 있을 때만)
+if [ -d worker/__tests__ ]; then
+  echo "▶ pre-push: 단위 테스트 검증"
+  if ! (cd worker && node --test __tests__/*.test.js > /dev/null 2>&1); then
+    echo ""
+    echo "❌ pre-push: 단위 테스트 실패 — push 차단"
+    echo "   상세: cd worker && node --test __tests__/*.test.js"
+    exit 1
+  fi
+fi
+
+# 5. wrangler.toml 의 [placement] 블록 차단 (Cloudflare 대시보드 region 덮어쓰기 방지)
+if [ -f worker/wrangler.toml ]; then
+  if grep -q "^\[placement\]" worker/wrangler.toml; then
+    echo "❌ pre-push: wrangler.toml 에 [placement] 블록 잔존 — push 차단"
+    echo "   대시보드 region 설정 (GCP US) 이 덮어씌워짐. 즉시 제거"
+    exit 1
+  fi
+fi
+
+echo "✅ pre-push: drift guard passed"
+exit 0

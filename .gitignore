@@ -1,0 +1,28 @@
+# 의존성
+node_modules/
+
+# 빌드 결과
+dist/
+docs/dist/
+
+# 환경/비밀
+.env
+.env.local
+.env.*.local
+
+# KV 백업 (대용량, gitignore 의무)
+kv-backup-*.json
+
+# 마이그레이션 임시
+anomalies.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# 로그
+*.log

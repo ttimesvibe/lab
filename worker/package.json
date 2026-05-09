@@ -1,0 +1,12 @@
+{
+  "name": "lab-worker",
+  "type": "module",
+  "private": true,
+  "version": "0.1.0",
+  "description": "lab fresh v2 — Cloudflare Worker (35+ endpoint + merge.js + permissions.js)",
+  "scripts": {
+    "test": "node --test __tests__/*.test.js",
+    "deploy": "npx -y wrangler deploy",
+    "tail": "npx -y wrangler tail"
+  }
+}

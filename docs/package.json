@@ -1,0 +1,23 @@
+{
+  "name": "lab-docs",
+  "type": "module",
+  "private": true,
+  "version": "0.1.0",
+  "description": "lab fresh v2 — Frontend (React 18 + vite 6 + 11 탭 + save engine)",
+  "scripts": {
+    "build": "node build.js",
+    "dev": "vite",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "react": "^18.3.0",
+    "react-dom": "^18.3.0",
+    "jszip": "^3.10.0",
+    "mammoth": "^1.8.0",
+    "dompurify": "^3.4.2"
+  },
+  "devDependencies": {
+    "vite": "^6.0.0",
+    "@vitejs/plugin-react": "^4.3.0"
+  }
+}
