@@ -44,7 +44,9 @@ function decodeJWT(token) {
   try {
     const padding = "=".repeat((4 - (parts[1].length % 4)) % 4);
     const b64 = (parts[1] + padding).replace(/-/g, "+").replace(/_/g, "/");
-    return JSON.parse(atob(b64));
+    // ★ UTF-8 디코딩 — 한글 등 multi-byte 문자 정확 처리
+    const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+    return JSON.parse(new TextDecoder("utf-8").decode(bytes));
   } catch {
     return null;
   }
