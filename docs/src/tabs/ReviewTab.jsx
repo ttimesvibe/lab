@@ -1,14 +1,15 @@
-// lab fresh v2 — ReviewTab (★ 실 UI Phase 2, paragraphs 시각화 + 삭제선)
+// lab fresh v2 — ReviewTab (★ 실 UI Phase 3, /analyze 연동)
 // 사료: editor/docs/src/tabs/ReviewTab.jsx (prod) + S2.4.2.a 0차 검토
 //
 // 책임:
 //   - 0차 검토 화면: 분량 요약 + paragraphs 본문 표시 + 삭제선 시각화
-//   - "1차 교정 시작" 버튼 (Phase 3 에서 /analyze + /correct 연동 예정)
-//
-// 본 컴포넌트는 사실상 read-only — paragraphs/blocks 직접 편집 X.
-//   onSave 는 _correctionStarted flag 박제 (engine markDirty trigger).
+//   - "분석 시작 (1차 교정 준비)" 버튼 → /analyze 호출 → correction.anal 박제
+//   - /correct chunking + diff UI 는 Phase 4 (다 세션)
 
-export function ReviewTab({ tabId, data, onSave, sessionId, config, currentTab, authUser }) {
+import { useState } from "react";
+import { apiAnalyze } from "../utils/api.js";
+
+export function ReviewTab({ tabId, data, onSave, onMultiSave, sessionId, config, currentTab, authUser }) {
   const reviewBlocks = data?.reviewBlocks || [];
   const cleanText = data?.cleanText || "";
   const paragraphs = data?.paragraphs || [];
@@ -23,9 +24,58 @@ export function ReviewTab({ tabId, data, onSave, sessionId, config, currentTab, 
   const cleanChars = cleanText.length;
   const deletedChars = totalChars - cleanChars;
 
-  function handleStartCorrection() {
-    // ★ Phase 3 에서 /analyze + /correct 연동 예정
-    onSave({ ...data, _correctionStarted: true });
+  const [analyzing, setAnalyzing] = useState(false);
+  const [analyzeError, setAnalyzeError] = useState("");
+  const [analyzeResult, setAnalyzeResult] = useState(null);  // 마지막 분석 결과 요약
+
+  /**
+   * ★ Phase 3: /analyze 호출 → correction.anal 박제.
+   * Phase 4 에서 /correct chunked 호출 + diff UI 추가 예정.
+   */
+  async function handleStartAnalyze() {
+    if (analyzing) return;
+    setAnalyzing(true);
+    setAnalyzeError("");
+    setAnalyzeResult(null);
+    try {
+      // full_text = cleanText (삭제 제거된 본문) — 최소 100자 보장
+      const fullText = cleanText || reviewBlocks.map((b) => `${b.speaker} ${b.timestamp}\n${b.text}`).join("\n\n");
+      if (fullText.length < 100) {
+        throw new Error(`원고가 너무 짧습니다 (현재 ${fullText.length}자, 최소 100자 필요).`);
+      }
+
+      const r = await apiAnalyze({ full_text: fullText }, config);
+      if (!r?.success || !r?.analysis) {
+        throw new Error(r?.error || "/analyze 응답에 analysis 가 없습니다");
+      }
+
+      const analysis = r.analysis;
+      const summary = {
+        speakers: analysis.speakers?.length || 0,
+        termCorrections: analysis.term_corrections?.length || 0,
+        domainTerms: analysis.domain_terms?.length || 0,
+        genre: analysis.genre?.primary || "(없음)",
+        techDifficulty: analysis.tech_difficulty || "(없음)",
+        topic: analysis.overview?.topic || "(없음)",
+      };
+      setAnalyzeResult(summary);
+
+      // correction.anal 박제 (다음 단계 /correct 가 사용)
+      // ★ onMultiSave 가 review (_analyzed flag) + correction (anal) 동시 갱신
+      if (typeof onMultiSave === "function") {
+        onMultiSave({
+          review: { ...data, _analyzed: true },
+          correction: { anal: analysis, blocks: reviewBlocks.filter((b) => !delSet.has(b.index)) },
+        });
+      } else {
+        onSave({ ...data, _analyzed: true });
+      }
+    } catch (e) {
+      console.error("[ReviewTab] analyze error:", e);
+      setAnalyzeError(e?.message || String(e));
+    } finally {
+      setAnalyzing(false);
+    }
   }
 
   if (reviewBlocks.length === 0) {
@@ -74,19 +124,42 @@ export function ReviewTab({ tabId, data, onSave, sessionId, config, currentTab, 
         </div>
       </div>
 
-      {/* 진행 버튼 */}
-      <div style={{ marginBottom: 16, display: "flex", justifyContent: "flex-end" }}>
-        <button
-          onClick={handleStartCorrection}
-          style={{
-            padding: "8px 20px", borderRadius: 6, border: "none",
-            background: "linear-gradient(135deg, #4a6cf7, #7c3aed)",
-            color: "#fff", fontSize: 13, fontWeight: 700, cursor: "pointer",
-            boxShadow: "0 2px 8px rgba(74,108,247,0.3)",
-          }}
-        >
-          {hasTrackChanges ? "삭제선 제거 → 1차 교정 시작" : "1차 교정 시작"}
-        </button>
+      {/* 진행 버튼 + 분석 결과 */}
+      <div style={{ marginBottom: 16 }}>
+        <div style={{ display: "flex", justifyContent: "flex-end", alignItems: "center", gap: 12 }}>
+          {analyzing && <span style={{ color: "#06f", fontSize: 13 }}>분석 중... (LLM 호출, 10~30초 소요)</span>}
+          <button
+            onClick={handleStartAnalyze}
+            disabled={analyzing}
+            style={{
+              padding: "8px 20px", borderRadius: 6, border: "none",
+              background: analyzing ? "#bbb" : "linear-gradient(135deg, #4a6cf7, #7c3aed)",
+              color: "#fff", fontSize: 13, fontWeight: 700,
+              cursor: analyzing ? "not-allowed" : "pointer",
+              boxShadow: analyzing ? "none" : "0 2px 8px rgba(74,108,247,0.3)",
+            }}
+          >
+            {analyzeResult ? "재분석" : (hasTrackChanges ? "삭제선 제거 → 분석 시작" : "분석 시작 (1차 교정 준비)")}
+          </button>
+        </div>
+        {analyzeError && (
+          <div style={{ marginTop: 8, padding: 10, background: "#fee2e2", borderRadius: 4, color: "#991b1b", fontSize: 13 }}>
+            ❌ {analyzeError}
+          </div>
+        )}
+        {analyzeResult && (
+          <div style={{ marginTop: 10, padding: 12, background: "#ecfdf5", borderRadius: 4, fontSize: 13 }}>
+            <div style={{ fontWeight: 700, color: "#047857", marginBottom: 6 }}>✅ 분석 완료 — correction.anal 박제됨</div>
+            <div style={{ color: "#065f46", lineHeight: 1.6 }}>
+              주제: {analyzeResult.topic}<br/>
+              화자 {analyzeResult.speakers}명 · 용어 교정 후보 {analyzeResult.termCorrections}건 · 전문용어 {analyzeResult.domainTerms}개<br/>
+              장르: {analyzeResult.genre} · 기술 난이도: {analyzeResult.techDifficulty}
+            </div>
+            <div style={{ marginTop: 8, fontSize: 12, color: "#666" }}>
+              ★ 다음 단계 (Phase 4): "1차 교정 시작" 버튼 → /correct chunked 호출 + diff UI
+            </div>
+          </div>
+        )}
       </div>
 
       {/* paragraphs 본문 (삭제선 시각화) */}
