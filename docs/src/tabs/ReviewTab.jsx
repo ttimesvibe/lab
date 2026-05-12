@@ -8,6 +8,7 @@
 
 import { useState } from "react";
 import { apiAnalyze } from "../utils/api.js";
+import { calcRegression, calcDuration, secondsToDisplay } from "../utils/lengthModel.js";
 
 export function ReviewTab({ tabId, data, onSave, onMultiSave, sessionId, config, currentTab, authUser }) {
   const reviewBlocks = data?.reviewBlocks || [];
@@ -23,6 +24,12 @@ export function ReviewTab({ tabId, data, onSave, onMultiSave, sessionId, config,
   );
   const cleanChars = cleanText.length;
   const deletedChars = totalChars - cleanChars;
+
+  // ★ 분량 예측 (LOO MAE 3.9% 선형회귀, 7건 학습)
+  //   keptSeconds: 타임스탬프 기반 잔존 분량 (삭제 80%+ 블록 제외)
+  //   reg.pointSec: cleanText 글자수 기반 예측 분량 + 95% 신뢰구간
+  const duration = calcDuration(reviewBlocks, delSet);
+  const reg = calcRegression(cleanChars);
 
   const [analyzing, setAnalyzing] = useState(false);
   const [analyzeError, setAnalyzeError] = useState("");
@@ -96,31 +103,39 @@ export function ReviewTab({ tabId, data, onSave, onMultiSave, sessionId, config,
     <div className="tab tab-review">
       <h2 style={{ margin: "0 0 12px 0" }}>0차 검토 (Review)</h2>
 
-      {/* 분량 요약 카드 */}
+      {/* 분량 요약 카드 — 원본 분량 + 잔존 + ★ 예상 영상 길이 (LOO MAE 3.9%) */}
       <div style={{ display: "flex", gap: 12, marginBottom: 16, flexWrap: "wrap" }}>
         <div style={{ flex: 1, minWidth: 180, padding: 12, background: "#f0f4ff", borderRadius: 6 }}>
           <div style={{ fontSize: 11, fontWeight: 700, color: "#345", textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 4 }}>
             📄 원본 분량
           </div>
           <div style={{ fontSize: 20, fontWeight: 700, color: "#234" }}>
-            {reviewBlocks.length} 블록
+            {duration.totalSeconds > 0 ? secondsToDisplay(duration.totalSeconds) : `${reviewBlocks.length} 블록`}
           </div>
           <div style={{ fontSize: 12, color: "#567" }}>
-            전체 {totalChars.toLocaleString()} 자
-            {hasTrackChanges && ` · 삭제 ${deletedChars.toLocaleString()} 자 (${Math.round((deletedChars / Math.max(totalChars, 1)) * 100)}%)`}
+            {totalChars.toLocaleString()}자 · {reviewBlocks.length}블록
+            {hasTrackChanges && ` · 삭제 ${deletedChars.toLocaleString()}자 (${Math.round((deletedChars / Math.max(totalChars, 1)) * 100)}%)`}
           </div>
         </div>
-        <div style={{ flex: 1, minWidth: 180, padding: 12, background: "#ecfdf5", borderRadius: 6 }}>
+
+        <div style={{ flex: 1, minWidth: 200, padding: 12, background: "#ecfdf5", borderRadius: 6, border: "1px solid rgba(34,197,94,0.2)" }}>
           <div style={{ fontSize: 11, fontWeight: 700, color: "#065f46", textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 4 }}>
-            ✅ 1차 교정 입력
+            🎬 예상 영상 길이
           </div>
-          <div style={{ fontSize: 20, fontWeight: 700, color: "#047857" }}>
-            {reviewBlocks.length - delSet.size} 블록 잔존
+          <div style={{ fontSize: 22, fontWeight: 800, color: "#047857" }}>
+            {secondsToDisplay(reg.pointSec)}
           </div>
-          <div style={{ fontSize: 12, color: "#059669" }}>
-            정리 텍스트 {cleanChars.toLocaleString()} 자
-            {delSet.size > 0 && ` · ${delSet.size} 블록 80%+ 삭제`}
+          <div style={{ marginTop: 4, padding: "3px 8px", borderRadius: 4, background: "rgba(34,197,94,0.1)", display: "inline-block", fontSize: 11, color: "#047857", fontWeight: 600 }}>
+            {secondsToDisplay(reg.lowSec)} ~ {secondsToDisplay(reg.highSec)} <span style={{ opacity: 0.7 }}>(95% CI)</span>
           </div>
+          <div style={{ fontSize: 11, color: "#059669", marginTop: 4 }}>
+            {reg.count}건 학습 · 선형회귀 LOO MAE 3.9% · 정리 후 {cleanChars.toLocaleString()}자
+          </div>
+          {duration.keptSeconds > 0 && (
+            <div style={{ fontSize: 11, color: "#059669", marginTop: 2 }}>
+              타임스탬프 기준 잔존: {secondsToDisplay(duration.keptSeconds)} · {reviewBlocks.length - delSet.size}블록
+            </div>
+          )}
         </div>
       </div>
 
