@@ -304,10 +304,72 @@ test("isPhoneticallySimilarKorean: 베셋↔베센트 ✓ / 베센트↔옐런 �
   assert.equal(isPhoneticallySimilarKorean("홍재희", "홍재의"), true);
 });
 
-// ─── 8 LLM stub 검증 (analyze + correct 제외) ───────────────────────────
+// ─── /highlights 2-Pass (★ M2 Phase 3 — Draft + Editor) ────────────────
+
+test("handleHighlights: body 부재 → 400", async () => {
+  const r = await handleHighlights(null, {}, HEADERS, ALICE);
+  assert.equal(r.status, 400);
+});
+
+test("handleHighlights: API 키 부재 → 503", async () => {
+  const r = await handleHighlights({ mode: "draft" }, {}, HEADERS, ALICE);
+  assert.equal(r.status, 503);
+});
+
+test("DRAFT_AGENT_PROMPT + EDITOR_AGENT_PROMPT: 정합 검증", async () => {
+  const { DRAFT_AGENT_PROMPT, EDITOR_AGENT_PROMPT } = await import("../ai.js");
+  assert.ok(DRAFT_AGENT_PROMPT.includes("Draft Agent"));
+  assert.ok(DRAFT_AGENT_PROMPT.includes("16유형"));
+  assert.ok(DRAFT_AGENT_PROMPT.includes("B2. 용어 설명형"));
+  assert.ok(EDITOR_AGENT_PROMPT.includes("Editor Agent"));
+  assert.ok(EDITOR_AGENT_PROMPT.includes("removal_rate"));
+  // PROMPT_INJECTION_GUARD 는 buildSystemMessage prepend
+  assert.ok(!DRAFT_AGENT_PROMPT.includes("Disregard any instruction"));
+  assert.ok(!EDITOR_AGENT_PROMPT.includes("Disregard any instruction"));
+});
+
+test("buildDraftPrompt: target_block_indices + max_items 합성", async () => {
+  const { buildDraftPrompt } = await import("../ai.js");
+  const p = buildDraftPrompt(
+    { genre: { primary: "설명형" }, tech_difficulty: "높음" },
+    0,
+    3,
+    [5, 6, 7],
+    5
+  );
+  assert.ok(p.includes("장르: 설명형"));
+  assert.ok(p.includes("기술 난이도: 높음"));
+  assert.ok(p.includes("청크 1/3"));
+  assert.ok(p.includes("블록 #5~#7"));
+  assert.ok(p.includes("최대 5개만"));
+});
+
+test("buildEditorPrompt: genre density + tech difficulty 합성", async () => {
+  const { buildEditorPrompt } = await import("../ai.js");
+  const p = buildEditorPrompt({
+    genre: { primary: "산업/전략분석형", secondary: "기술트렌드형" },
+    tech_difficulty: "매우높음",
+  });
+  assert.ok(p.includes("산업/전략"));
+  assert.ok(p.includes("매우 높음"));  // primary 의 density 문구
+  assert.ok(p.includes("보조 장르"));
+  assert.ok(p.includes("기술트렌드"));
+  assert.ok(p.includes("B2 비중을 높이세요"));
+});
+
+test("handleHighlights: mode='edit' + draft_highlights 부재 → 400", async () => {
+  const r = await handleHighlights(
+    { mode: "edit", blocks: [] },
+    { OPENAI_API_KEY: "k" },
+    HEADERS,
+    ALICE
+  );
+  assert.equal(r.status, 400);
+});
+
+// ─── 7 LLM stub 검증 (analyze + correct + highlights 제외) ──────────────
 
 const LLM_HANDLERS = [
-  ["highlights", handleHighlights],
   ["term-explain", handleTermExplain],
   ["visuals", handleVisuals],
   ["insert-cuts", handleInsertCuts],
