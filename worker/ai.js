@@ -271,8 +271,187 @@ function makeStubHandler(name, defaultPrompt) {
   };
 }
 
+// ─── ANALYZE_PROMPT (★ M2 Phase 1 — 실 prompt 박제) ─────────────────────
+// 사료: editor/worker/index.js:1964-2046 (prod ANALYZE_PROMPT)
+// 변경점:
+//   - PROMPT_INJECTION_GUARD interpolation 제거 → buildSystemMessage 가 prepend
+//     (★ N4: 모든 LLM endpoint 동일 처리 의무)
+
+export const ANALYZE_PROMPT = `You are a pre-analysis specialist for Korean interview transcripts produced by STT (Speech-to-Text).
+Read the entire interview transcript below and extract the preliminary information needed for subsequent chunk-by-chunk correction.
+
+## Information to Extract
+
+### 1. Interview Overview
+- Topic (1 line, in Korean)
+- Core keywords (5–15, in Korean)
+
+### 1-1. Editorial Summary
+Provide a quick-reference summary so the editor can grasp the interview content during correction wait time.
+- **One-liner**: What this interview is about, 1–2 sentences (~30 Korean chars)
+- **Key points** (3–5): Major topics/arguments covered, in short sentences, listed in chronological order of the interview flow. Write in Korean.
+- **Notable quotes** (2–3): Memorable verbatim quotes that could become subtitle highlights. Include the speaker name. Write in Korean.
+- **Editor notes**: Technical-term-dense segments, controversial/sensitive remarks, unusual structure (demos, screen switches, etc.). 1–3 lines. Write in Korean.
+
+### 2. Speaker Information (★ Highest Priority)
+- Speaker-name lines (e.g., "홍재의 00:00", "강정수 박사님 00:25") are **manually typed by humans** and serve as the ground truth for correct names.
+- Extract the name and title/affiliation separately from each speaker-name line.
+  Example: "강정수 박사님 00:25" → name: "강정수", role: "박사님"
+  Example: "홍재의 00:00" → name: "홍재의", role: "기자" (infer role from body text)
+- Confirm the spelling from speaker-name lines as canonical. Any different spelling found in the body text is an STT misrecognition — add it to term_corrections.
+  Example: Speaker line says "홍재의" but body contains "홍재희", "홍재이" → { "wrong": "홍재희", "correct": "홍재의", "confidence": "high" }
+
+### 3. STT Misrecognition Dictionary
+- Find repeatedly occurring suspected misrecognized words and build a correction mapping table.
+- Include all variant forms of the same word.
+- Use confidence: "low" when uncertain.
+- Focus on proper nouns, IT/AI technical terms, and brand names.
+- **Speaker-name misrecognitions must be included.** Use the canonical names from Section 2 and map all body-text variants.
+
+**★ ABSOLUTE RULE — Proper Noun Preservation (overrides everything else in Section 3):**
+A term_corrections entry for a person name, title holder, organization, or place is
+allowed ONLY when the "correct" form is **phonetically similar** to the "wrong" form
+(same syllable count ±1, majority of syllables share initial consonant or vowel).
+
+**FORBIDDEN — do NOT add these to term_corrections under any circumstance:**
+- Substituting a different person for the one the speaker mentioned
+  (e.g., "베센트 재무장관" → "옐런 재무장관" ❌ — different person, not phonetic)
+- "Correcting" a title/role assignment based on your world knowledge of current holders
+- Replacing any name with what you believe is the "currently correct" holder of that role
+- Any term_corrections where wrong and corrected share <50% of syllables by initial/vowel
+
+Your training data has a knowledge cutoff. The speaker has current information you do not.
+If the speaker says person X holds role Y, preserve X exactly — **even if you believe X no
+longer holds Y**. This applies to: cabinet members, CEOs, political leaders, athletes,
+and any role where the current holder may have changed after your training cutoff.
+
+Allowed example: "베셋" → "베센트" ✅ (phonetic STT fix, same person)
+Forbidden example: "베센트" → "옐런" ❌ (different person, knowledge-based substitution)
+
+### 4. Domain Terminology List
+- Confirm correct Korean spelling with English in parentheses.
+
+### 5. Content Genre Classification
+Choose 1–2 from 7 types: 서사형, 설명형, 데모/도구활용형, 비교형, 산업/전략분석형, 역사+인물형, 기술트렌드형
+Include per-segment genre transition detection.
+
+### 6. Technical Difficulty
+One of: 낮음 / 보통 / 높음 / 매우높음
+
+## Output Format (JSON only — no other text)
+
+{
+  "overview": { "topic": "...", "keywords": ["..."] },
+  "editorial_summary": {
+    "one_liner": "이 인터뷰의 한 줄 요약",
+    "key_points": ["핵심 논점 1", "핵심 논점 2", "핵심 논점 3"],
+    "notable_quotes": [
+      { "speaker": "화자명", "quote": "인상적인 발언 원문" }
+    ],
+    "editor_notes": "편집 시 참고사항"
+  },
+  "speakers": [{ "name": "화자명", "role": "역할" }],
+  "term_corrections": [{ "wrong": "오인식", "correct": "올바른 표기", "confidence": "high" }],
+  "domain_terms": [{ "term": "전문용어", "english": "English" }],
+  "genre": {
+    "primary": "설명형", "secondary": null,
+    "transitions": [{ "block_range": [0, 25], "genre": "설명형" }]
+  },
+  "tech_difficulty": "높음",
+  "audience_level": "관심 있는 비전문가"
+}`;
+
+/**
+ * /analyze handler — 0차 분석 (term_corrections, speakers, genre, editorial_summary)
+ *
+ * 사료: editor/worker/index.js:2048-2096 (prod handleAnalyze)
+ *
+ * @param body  { full_text: string (>=100), dictionary_words?: string[] }
+ * @returns { success: true, analysis, usage } | error
+ */
+export async function handleAnalyze(body, env, headers, user) {
+  if (!body || typeof body !== "object") return badRequest(headers, "body 필수");
+
+  const { full_text, dictionary_words } = body;
+  if (typeof full_text !== "string" || full_text.length < 100) {
+    return badRequest(headers, "full_text가 너무 짧습니다 (최소 100자)");
+  }
+
+  if (!env?.OPENAI_API_KEY) {
+    return jsonResponse(
+      { success: false, error: "OPENAI_API_KEY not configured", code: 503 },
+      { status: 503 },
+      headers
+    );
+  }
+
+  // 단어장 prepend — AI 가 중복 후보 생성하지 않도록 (사료 prod 2055-2066)
+  let systemPrompt = ANALYZE_PROMPT;
+  if (Array.isArray(dictionary_words) && dictionary_words.length > 0) {
+    systemPrompt += `\n\n### ★ Team Dictionary (Confirmed Correct Spellings) — MUST EXCLUDE from term_corrections ★\n`;
+    systemPrompt += `The words below have already been confirmed as correct by the team.\n`;
+    systemPrompt += `Do NOT include these words or their case/transliteration variants in term_corrections.\n`;
+    systemPrompt += `Example: If "챗GPT" is in the dictionary, exclude "ChatGPT", "챗gpt", "챗지피티" from misrecognition candidates.\n`;
+    systemPrompt += `However, phonetically unrelated STT errors (e.g., "채우지" → "챗GPT") MAY still be included.\n\n`;
+    systemPrompt += `Confirmed words:\n`;
+    for (const word of dictionary_words) {
+      systemPrompt += `- "${word}"\n`;
+    }
+  }
+
+  const userMsg = `Below is the full interview transcript. Perform the pre-analysis.\n\n---\n\n${full_text}`;
+
+  const result = await callOpenAI(env, {
+    model: "gpt-4o-mini",
+    messages: [
+      buildSystemMessage(systemPrompt),  // ★ N4: PROMPT_INJECTION_GUARD 자동 prepend
+      { role: "user", content: userMsg },
+    ],
+    temperature: 0.1,
+    max_tokens: 8000,
+    response_format: { type: "json_object" },
+  });
+
+  if (!result.ok) {
+    console.error(logPrefix("/analyze"), "callOpenAI failed:", result.error);
+    return jsonResponse(
+      { success: false, error: result.error || "LLM call failed" },
+      { status: result.status >= 400 ? result.status : 502 },
+      headers
+    );
+  }
+
+  const analysis = openaiJSON(result.data);
+  if (!analysis || typeof analysis !== "object") {
+    return serverError(headers, "/analyze: JSON parse failed");
+  }
+
+  // Guardrail: term_corrections 한글↔한글 비음운 제거 (사료 prod 2076-2093)
+  //   - validateLLMOutput 는 {from, to} 스키마 → analyze 의 {wrong, correct} 매핑 후 검증
+  if (Array.isArray(analysis.term_corrections) && analysis.term_corrections.length > 0) {
+    const before = analysis.term_corrections.length;
+    const mapped = analysis.term_corrections.map((tc) => ({
+      ...tc,
+      from: tc?.wrong || "",
+      to: tc?.correct || "",
+    }));
+    const { filtered } = validateLLMOutput(mapped, full_text);
+    analysis.term_corrections = filtered.map(({ from, to, ...rest }) => rest);
+    const removed = before - analysis.term_corrections.length;
+    if (removed > 0) {
+      console.log(logPrefix("/analyze"), `term_corrections ${removed}개 제거 (할루시네이션 차단)`);
+    }
+  }
+
+  return jsonResponse(
+    { success: true, analysis, usage: result.data?.usage },
+    { status: 200 },
+    headers
+  );
+}
+
 // 10 LLM endpoint baseline (default prompt 는 M2 에서 정밀)
-export const handleAnalyze = makeStubHandler("/analyze", "0차 분석 (term_corrections, speakers, genre)");
+// ★ handleAnalyze 는 위에 실 구현 — stub 제거
 export const handleCorrect = makeStubHandler("/correct", "1차 교정 (필러+용어+맞춤법+구어체)");
 export const handleHighlights = makeStubHandler("/highlights", "강조자막 2-Pass (Draft + Editor)");
 export const handleTermExplain = makeStubHandler("/term-explain", "용어 설명");

@@ -141,31 +141,77 @@ test("callGemini: env.GEMINI_API_KEY 부재 → ok:false", async () => {
   assert.ok(r.error.includes("GEMINI_API_KEY"));
 });
 
-// ─── 10 LLM endpoint baseline (stub 검증) ───────────────────────────────
-
-test("handleAnalyze: API 키 부재 → 503 + warnings", async () => {
-  const r = await handleAnalyze({ text: "x" }, {}, HEADERS, ALICE);
-  assert.equal(r.status, 503);
-  const body = await r.json();
-  assert.ok(body.warnings);
-});
-
-test("handleAnalyze: API 키 박제 시 → 501 (baseline stub) + PROMPT_INJECTION_GUARD 적용 ✓ warning", async () => {
-  const env = { OPENAI_API_KEY: "test-key" };
-  const r = await handleAnalyze({ text: "x" }, env, HEADERS, ALICE);
-  assert.equal(r.status, 501);
-  const body = await r.json();
-  assert.ok(body.warnings.some((w) => w.includes("PROMPT_INJECTION_GUARD")));
-});
+// ─── /analyze (★ M2 Phase 1 — 실 prompt 박제) ───────────────────────────
 
 test("handleAnalyze: body 부재 → 400", async () => {
   const r = await handleAnalyze(null, {}, HEADERS, ALICE);
   assert.equal(r.status, 400);
 });
 
-// 10 LLM 모두 stub 동작 검증 (★ N4 — subtitle-format 포함)
+test("handleAnalyze: full_text 짧음 → 400 (최소 100자)", async () => {
+  const r = await handleAnalyze({ full_text: "짧은 텍스트" }, { OPENAI_API_KEY: "k" }, HEADERS, ALICE);
+  assert.equal(r.status, 400);
+});
+
+test("handleAnalyze: full_text 충분 + API 키 부재 → 503", async () => {
+  const longText = "x".repeat(150);
+  const r = await handleAnalyze({ full_text: longText }, {}, HEADERS, ALICE);
+  assert.equal(r.status, 503);
+  const body = await r.json();
+  assert.equal(body.code, 503);
+});
+
+test("ANALYZE_PROMPT: prod 사료 정합 (핵심 키워드 검증)", async () => {
+  const { ANALYZE_PROMPT } = await import("../ai.js");
+  assert.ok(ANALYZE_PROMPT.includes("Korean interview transcripts"));
+  assert.ok(ANALYZE_PROMPT.includes("term_corrections"));
+  assert.ok(ANALYZE_PROMPT.includes("Proper Noun Preservation"));
+  assert.ok(ANALYZE_PROMPT.includes("editorial_summary"));
+  assert.ok(ANALYZE_PROMPT.includes("genre"));
+  // PROMPT_INJECTION_GUARD 는 buildSystemMessage 가 prepend — prompt 자체에는 X
+  assert.ok(!ANALYZE_PROMPT.includes("Disregard any instruction"));
+});
+
+test("handleAnalyze: 실 LLM 응답 mock — term_corrections 할루시네이션 제거", async () => {
+  // fetch mock — callOpenAI 우회
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response(JSON.stringify({
+    choices: [{ message: { content: JSON.stringify({
+      overview: { topic: "AI", keywords: ["AI", "LLM"] },
+      speakers: [{ name: "홍재의", role: "기자" }],
+      term_corrections: [
+        { wrong: "베셋", correct: "베센트", confidence: "high" },     // ✓ 음운 유사 (한글)
+        { wrong: "베센트", correct: "옐런", confidence: "high" },     // ✗ 비음운 (할루시네이션) — 제거 대상
+        { wrong: "ChatGPT", correct: "챗GPT", confidence: "high" },  // ✓ Latin↔Hangul (통과)
+      ],
+      genre: { primary: "설명형" },
+      tech_difficulty: "보통",
+    }) } }],
+    usage: { total_tokens: 100 },
+  }), { status: 200 });
+  try {
+    const longText = "오늘은 베센트 재무장관에 대해 이야기해보겠습니다. ".repeat(10);
+    const r = await handleAnalyze({ full_text: longText }, { OPENAI_API_KEY: "k" }, HEADERS, ALICE);
+    assert.equal(r.status, 200);
+    const body = await r.json();
+    assert.equal(body.success, true);
+    // 할루시네이션 1개 제거 → 2개 남음
+    assert.equal(body.analysis.term_corrections.length, 2);
+    const wrongs = body.analysis.term_corrections.map((tc) => tc.wrong);
+    assert.ok(wrongs.includes("베셋"));
+    assert.ok(wrongs.includes("ChatGPT"));
+    assert.ok(!wrongs.includes("베센트"));  // ✗ 제거됨
+    // {from, to} 매핑 키 누출 X
+    assert.ok(!body.analysis.term_corrections[0].from);
+    assert.ok(!body.analysis.term_corrections[0].to);
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});
+
+// ─── 9 LLM stub 검증 (handleAnalyze 제외 — 실 구현됨) ───────────────────
+
 const LLM_HANDLERS = [
-  ["analyze", handleAnalyze],
   ["correct", handleCorrect],
   ["highlights", handleHighlights],
   ["term-explain", handleTermExplain],
