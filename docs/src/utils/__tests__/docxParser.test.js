@@ -7,7 +7,7 @@ import {
   parseBodyXml, extractTextFromRun, extractTextFromRuns, computeBlockStrikes,
   STRIKE_DETECT_RE,
 } from "../docxParser.js";
-import { parseBlocks } from "../parseBlocks.js";
+import { parseBlocks, stripStrikeFromBlocks } from "../parseBlocks.js";
 
 // ─── STRIKE_DETECT_RE ────────────────────────────────────────────────────
 
@@ -159,6 +159,52 @@ test("computeBlockStrikes: 부분 삭제 → ranges 박제", () => {
   // [삭제] = 4 chars (chars 2-5)
   assert.equal(r.blockStrikeRanges[0][0].s, 2);
   assert.equal(r.blockStrikeRanges[0][0].e, 6);
+});
+
+// ─── stripStrikeFromBlocks (★ Phase 3b fix — LLM 입력 strike 제외) ───────
+
+test("stripStrikeFromBlocks: ranges 없으면 원본 그대로", () => {
+  const blocks = [{ index: 0, text: "안녕하세요" }];
+  const r = stripStrikeFromBlocks(blocks, {});
+  assert.equal(r[0].text, "안녕하세요");
+});
+
+test("stripStrikeFromBlocks: 단일 range 제거", () => {
+  // "안녕[삭제]하세요" — chars 2-6 삭제
+  const blocks = [{ index: 0, text: "안녕[삭제]하세요" }];
+  const ranges = { 0: [{ s: 2, e: 6 }] };
+  const r = stripStrikeFromBlocks(blocks, ranges);
+  assert.equal(r[0].text, "안녕하세요");
+});
+
+test("stripStrikeFromBlocks: 여러 range 제거 (뒤에서부터 처리, 인덱스 안 밀림)", () => {
+  // "ABC[X]DEF[Y]GHI" — chars 3-6 (X) + 9-12 (Y) 삭제
+  const blocks = [{ index: 0, text: "ABC[X]DEF[Y]GHI" }];
+  const ranges = { 0: [{ s: 3, e: 6 }, { s: 9, e: 12 }] };
+  const r = stripStrikeFromBlocks(blocks, ranges);
+  assert.equal(r[0].text, "ABCDEFGHI");
+});
+
+test("stripStrikeFromBlocks: blockIndex 별 독립 처리", () => {
+  const blocks = [
+    { index: 0, text: "AAAAA" },        // strip
+    { index: 1, text: "BBBBB" },        // 그대로
+    { index: 2, text: "CCCCC" },        // strip
+  ];
+  const ranges = {
+    0: [{ s: 1, e: 3 }],
+    2: [{ s: 2, e: 4 }],
+  };
+  const r = stripStrikeFromBlocks(blocks, ranges);
+  assert.equal(r[0].text, "AAA");
+  assert.equal(r[1].text, "BBBBB");
+  assert.equal(r[2].text, "CCC");
+});
+
+test("stripStrikeFromBlocks: blockStrikeRanges null/undefined → 그대로 반환", () => {
+  const blocks = [{ index: 0, text: "ABC" }];
+  assert.equal(stripStrikeFromBlocks(blocks, null)[0].text, "ABC");
+  assert.equal(stripStrikeFromBlocks(blocks, undefined)[0].text, "ABC");
 });
 
 test("computeBlockStrikes: 80% 이상 삭제 → deletedBlockIndices", () => {

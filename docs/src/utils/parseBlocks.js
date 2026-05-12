@@ -60,6 +60,32 @@ export function parseBlocks(text) {
 }
 
 /**
+ * Strip strike-through ranges from each block's text.
+ *
+ * 사용처: ReviewTab → CorrectionTab 으로 blocks 전달 시 strike 제외
+ * (LLM 이 strike 도 일반 텍스트로 인식하지 않도록).
+ *
+ * @param blocks reviewBlocks (parseBlocks 결과, text 에 strike 포함)
+ * @param blockStrikeRanges { [blockIndex]: [{s, e}, ...] }
+ * @returns 같은 구조이되 text 에서 strike 영역 제거된 blocks
+ */
+export function stripStrikeFromBlocks(blocks, blockStrikeRanges) {
+  if (!blockStrikeRanges || typeof blockStrikeRanges !== "object") return blocks;
+  return blocks.map((b) => {
+    const ranges = blockStrikeRanges[b.index];
+    if (!Array.isArray(ranges) || ranges.length === 0) return b;
+    let text = b.text || "";
+    // 뒤에서부터 strip — 앞 인덱스 변동 회피
+    const sorted = [...ranges].sort((a, b) => b.s - a.s);
+    for (const r of sorted) {
+      if (typeof r.s !== "number" || typeof r.e !== "number") continue;
+      text = text.slice(0, r.s) + text.slice(r.e);
+    }
+    return { ...b, text };
+  });
+}
+
+/**
  * Compose manuscript + review data from raw docx parse result.
  *
  * @param {object} tc — { paragraphs, hasTrackChanges, fullText, cleanText }

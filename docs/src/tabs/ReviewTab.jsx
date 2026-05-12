@@ -9,6 +9,7 @@
 import { useState } from "react";
 import { apiAnalyze } from "../utils/api.js";
 import { calcRegression, calcDuration, secondsToDisplay } from "../utils/lengthModel.js";
+import { stripStrikeFromBlocks } from "../utils/parseBlocks.js";
 
 export function ReviewTab({ tabId, data, onSave, onMultiSave, sessionId, config, currentTab, authUser }) {
   const reviewBlocks = data?.reviewBlocks || [];
@@ -69,11 +70,17 @@ export function ReviewTab({ tabId, data, onSave, onMultiSave, sessionId, config,
       };
 
       // ★ review._analysisSummary 박제 → 탭 이동/리로드 후에도 시각 표시 보존
-      // ★ correction.anal 박제 → 다음 단계 /correct 가 사용
+      // ★ correction.anal + blocks 박제 → 다음 단계 /correct 가 사용
+      //   1) 80%+ 삭제 블록 제외 (delSet)
+      //   2) 각 블록 내 strike segment 도 제거 (stripStrikeFromBlocks)
+      //   → LLM 입력에서 삭제선 영역 완전 배제 (사용자 보고 fix)
+      const keptBlocks = reviewBlocks.filter((b) => !delSet.has(b.index));
+      const cleanedBlocks = stripStrikeFromBlocks(keptBlocks, data?.blockStrikeRanges);
+
       if (typeof onMultiSave === "function") {
         onMultiSave({
           review: { ...data, _analyzed: true, _analysisSummary: summary },
-          correction: { anal: analysis, blocks: reviewBlocks.filter((b) => !delSet.has(b.index)) },
+          correction: { anal: analysis, blocks: cleanedBlocks },
         });
       } else {
         onSave({ ...data, _analyzed: true, _analysisSummary: summary });
