@@ -33,7 +33,9 @@ export function ReviewTab({ tabId, data, onSave, onMultiSave, sessionId, config,
 
   const [analyzing, setAnalyzing] = useState(false);
   const [analyzeError, setAnalyzeError] = useState("");
-  const [analyzeResult, setAnalyzeResult] = useState(null);  // 마지막 분석 결과 요약
+  // ★ 분석 결과는 review.data._analysisSummary 에 박제 (탭 이동/리로드 후에도 보존)
+  //   data 가 바뀌면 자동 반영. 별도 useState X.
+  const analyzeResult = data?._analysisSummary || null;
 
   /**
    * ★ Phase 3: /analyze 호출 → correction.anal 박제.
@@ -43,7 +45,6 @@ export function ReviewTab({ tabId, data, onSave, onMultiSave, sessionId, config,
     if (analyzing) return;
     setAnalyzing(true);
     setAnalyzeError("");
-    setAnalyzeResult(null);
     try {
       // full_text = cleanText (삭제 제거된 본문) — 최소 100자 보장
       const fullText = cleanText || reviewBlocks.map((b) => `${b.speaker} ${b.timestamp}\n${b.text}`).join("\n\n");
@@ -64,18 +65,18 @@ export function ReviewTab({ tabId, data, onSave, onMultiSave, sessionId, config,
         genre: analysis.genre?.primary || "(없음)",
         techDifficulty: analysis.tech_difficulty || "(없음)",
         topic: analysis.overview?.topic || "(없음)",
+        analyzedAt: new Date().toISOString(),
       };
-      setAnalyzeResult(summary);
 
-      // correction.anal 박제 (다음 단계 /correct 가 사용)
-      // ★ onMultiSave 가 review (_analyzed flag) + correction (anal) 동시 갱신
+      // ★ review._analysisSummary 박제 → 탭 이동/리로드 후에도 시각 표시 보존
+      // ★ correction.anal 박제 → 다음 단계 /correct 가 사용
       if (typeof onMultiSave === "function") {
         onMultiSave({
-          review: { ...data, _analyzed: true },
+          review: { ...data, _analyzed: true, _analysisSummary: summary },
           correction: { anal: analysis, blocks: reviewBlocks.filter((b) => !delSet.has(b.index)) },
         });
       } else {
-        onSave({ ...data, _analyzed: true });
+        onSave({ ...data, _analyzed: true, _analysisSummary: summary });
       }
     } catch (e) {
       console.error("[ReviewTab] analyze error:", e);

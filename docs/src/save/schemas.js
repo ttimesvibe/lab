@@ -25,7 +25,7 @@ export const TAB_SCHEMAS = Object.freeze({
     required: [],
   },
   review: {
-    fields: ["reviewBlocks", "paragraphs", "blockStrikeRanges", "deletedBlockIndices", "duration", "cleanText", "hasTrackChanges"],
+    fields: ["reviewBlocks", "paragraphs", "blockStrikeRanges", "deletedBlockIndices", "duration", "cleanText", "hasTrackChanges", "_analyzed", "_analysisSummary"],
     required: [],
   },
   correction: {
