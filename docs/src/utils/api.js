@@ -396,45 +396,50 @@ export async function apiDictPost(dict, cfg) {
 }
 
 // ─── 9. AI 10 LLM ───────────────────────────────────────────────────────
+// ★ LLM 호출은 30~120초 소요 — DEFAULT_TIMEOUT_MS (30초) 부족 → 180초 박제
+//   retry: false — 워커측 429 재시도 (3회) 이미 박혀있음. 클라 재시도 시 OpenAI 토큰 중복 청구.
+
+const LLM_OPTS = Object.freeze({ timeoutMs: 180_000, retry: false });
 
 export async function apiAnalyze(body, cfg) {
-  return await apiCall({ url: buildUrl(cfg, "/analyze"), method: "POST", body });
+  return await apiCall({ ...LLM_OPTS, url: buildUrl(cfg, "/analyze"), method: "POST", body });
 }
 
 export async function apiCorrect(body, cfg) {
-  return await apiCall({ url: buildUrl(cfg, "/correct"), method: "POST", body });
+  return await apiCall({ ...LLM_OPTS, url: buildUrl(cfg, "/correct"), method: "POST", body });
 }
 
 export async function apiHighlights(body, cfg) {
-  return await apiCall({ url: buildUrl(cfg, "/highlights"), method: "POST", body });
+  return await apiCall({ ...LLM_OPTS, url: buildUrl(cfg, "/highlights"), method: "POST", body });
 }
 
 export async function apiTermExplain(body, cfg) {
-  return await apiCall({ url: buildUrl(cfg, "/term-explain"), method: "POST", body });
+  return await apiCall({ ...LLM_OPTS, url: buildUrl(cfg, "/term-explain"), method: "POST", body });
 }
 
 export async function apiVisuals(body, cfg) {
-  return await apiCall({ url: buildUrl(cfg, "/visuals"), method: "POST", body });
+  return await apiCall({ ...LLM_OPTS, url: buildUrl(cfg, "/visuals"), method: "POST", body });
 }
 
 export async function apiInsertCuts(body, cfg) {
-  return await apiCall({ url: buildUrl(cfg, "/insert-cuts"), method: "POST", body });
+  return await apiCall({ ...LLM_OPTS, url: buildUrl(cfg, "/insert-cuts"), method: "POST", body });
 }
 
 export async function apiHlRecommend(body, cfg) {
-  return await apiCall({ url: buildUrl(cfg, "/hl-recommend"), method: "POST", body });
+  return await apiCall({ ...LLM_OPTS, url: buildUrl(cfg, "/hl-recommend"), method: "POST", body });
 }
 
 export async function apiHlTimestamps(body, cfg) {
-  return await apiCall({ url: buildUrl(cfg, "/hl-timestamps"), method: "POST", body });
+  return await apiCall({ ...LLM_OPTS, url: buildUrl(cfg, "/hl-timestamps"), method: "POST", body });
 }
 
 export async function apiSetgen(body, cfg) {
-  return await apiCall({ url: buildUrl(cfg, "/setgen"), method: "POST", body });
+  // /setgen 은 multi-step (트렌드 RSS + 3 GPT 병렬) — 더 긴 timeout
+  return await apiCall({ timeoutMs: 240_000, retry: false, url: buildUrl(cfg, "/setgen"), method: "POST", body });
 }
 
 export async function apiSubtitleFormat(body, cfg) {
-  return await apiCall({ url: buildUrl(cfg, "/subtitle-format"), method: "POST", body });
+  return await apiCall({ ...LLM_OPTS, url: buildUrl(cfg, "/subtitle-format"), method: "POST", body });
 }
 
 // ─── User-friendly error helper ─────────────────────────────────────────
