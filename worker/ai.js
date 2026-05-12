@@ -1234,7 +1234,88 @@ export async function handleHighlights(body, env, headers, user) {
   if (mode === "edit") return handleEdit(body, env, headers);
   return handleDraft(body, env, headers);
 }
-export const handleTermExplain = makeStubHandler("/term-explain", "용어 설명");
+// ─── /term-explain (★ M2 Phase 6a — 용어 설명, Gemini→OpenAI 폴백) ─────
+// 사료: editor/worker/index.js:3573-3650
+
+export const TERM_EXPLAIN_PROMPT = `당신은 영상 강조자막용 용어 설명 작성 전문가입니다.
+주어진 용어에 대해 시청자가 바로 이해할 수 있는 1~2줄 짜리 설명을 생성하세요.
+
+## 형식
+용어(영문 원어) : 일상 언어로 풀어쓴 정의
+
+## 규칙
+- 40~150자 사이
+- 전문 용어를 일상 언어로 번역
+- 일상 비유를 포함하면 이해도가 올라감
+- 구어체 금지, 간결체로 작성
+- 반드시 JSON만 출력: { "explanation": "생성된 설명" }`;
+
+export async function handleTermExplain(body, env, headers, user) {
+  if (!body || typeof body !== "object") return badRequest(headers, "body 필수");
+  const { term, context } = body;
+  if (typeof term !== "string" || term.length === 0) return badRequest(headers, "term is required");
+
+  const systemPrompt = TERM_EXPLAIN_PROMPT;
+  const userMessage = `용어: ${term}${context ? `\n\n참고 맥락:\n${context}` : ""}`;
+  // ★ N4: PROMPT_INJECTION_GUARD prepend (system + user 결합 시 system prefix 에 박힘)
+  const sysWithGuard = buildSystemMessage(systemPrompt);
+
+  // 1차: Gemini 2.0-flash → 2.5-flash 순차
+  if (env?.GEMINI_API_KEY) {
+    for (const model of ["gemini-2.0-flash", "gemini-2.5-flash"]) {
+      const r = await callGemini(env, {
+        model,
+        body: {
+          contents: [{ parts: [{ text: sysWithGuard.content + "\n\n" + userMessage }] }],
+          generationConfig: { temperature: 0.3, maxOutputTokens: 2000 },
+        },
+      });
+      if (r.ok) {
+        const text = r.data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
+        if (text) {
+          let jsonStr = text.trim();
+          const fenceMatch = jsonStr.match(/```(?:json)?\s*([\s\S]*?)```/);
+          if (fenceMatch) jsonStr = fenceMatch[1].trim();
+          const braceStart = jsonStr.indexOf("{");
+          const braceEnd = jsonStr.lastIndexOf("}");
+          if (braceStart !== -1 && braceEnd !== -1) jsonStr = jsonStr.substring(braceStart, braceEnd + 1);
+          try {
+            const parsed = JSON.parse(jsonStr);
+            return jsonResponse({ success: true, result: parsed }, { status: 200 }, headers);
+          } catch {
+            return jsonResponse({ success: true, result: { explanation: text.trim() } }, { status: 200 }, headers);
+          }
+        }
+      }
+      console.warn(logPrefix("/term-explain"), `gemini ${model} failed: ${r.status}`);
+    }
+  }
+
+  // 2차: OpenAI 폴백 (region US 일 때)
+  if (!env?.OPENAI_API_KEY) {
+    return jsonResponse(
+      { success: false, error: "All AI providers failed (Gemini unavailable, OpenAI key missing)" },
+      { status: 502 },
+      headers
+    );
+  }
+  const result = await callOpenAI(env, {
+    model: "gpt-4.1-mini",
+    messages: [sysWithGuard, { role: "user", content: userMessage }],
+    temperature: 0.3,
+    max_tokens: 2000,
+    response_format: { type: "json_object" },
+  });
+  if (!result.ok) {
+    return jsonResponse(
+      { success: false, error: `All providers failed. Last: ${result.error}` },
+      { status: result.status >= 400 ? result.status : 502 },
+      headers
+    );
+  }
+  const parsed = openaiJSON(result.data);
+  return jsonResponse({ success: true, result: parsed }, { status: 200 }, headers);
+}
 // ─── /visuals (★ M2 Phase 5a — 시각자료 추천) ──────────────────────────
 // 사료: editor/worker/index.js:3656-3756 (prod VISUALS + VISUAL_TYPES_SPEC)
 
@@ -1549,5 +1630,249 @@ export async function handleHlTimestamps(body, env, headers, user) {
   if (!parsed) return serverError(headers, "/hl-timestamps: JSON parse failed");
   return jsonResponse({ success: true, result: parsed, usage: result.data?.usage }, { status: 200 }, headers);
 }
-export const handleSetgen = makeStubHandler("/setgen", "세트 생성");
+// ─── /setgen (★ M2 Phase 6b — 세트 생성 키워드+트렌드+3종 GPT) ────────
+// 사료: editor/worker/index.js:3983-4212
+
+export const SETGEN_KEYWORD_SYSTEM = `인터뷰 원고에서 유튜브 검색에 활용할 핵심 키워드를 추출합니다.
+JSON만 출력. 다른 텍스트 없이.
+{"keywords":["키워드1","키워드2",...],"guest_summary":"게스트 한줄 소개","notable_quotes":["인상적 발언1","인상적 발언2"]}
+규칙:
+- keywords: 6~10개. 고유명사(인물, 기업, 서비스명) 우선. "AI 커머스"처럼 구체화
+- notable_quotes: 원고에서 게스트가 한 인상적 발언 3~5개 (원문 그대로). 직관적이고 파급력 있는 표현 우선`;
+
+/**
+ * Setgen prompt builder (4 type: balanced / script / focus / trend).
+ * 사료: editor/worker/index.js:3993-4044 (prod makeSetgenPrompt)
+ */
+export function makeSetgenPrompt(type) {
+  const typeGuide = {
+    balanced: "## 이번 후보: ⚖️ 밸런스형\n원고의 핵심 발언 + 시의성 있는 트렌드의 교집합을 찾아 앵글을 잡습니다.\n- 썸네일/제목: 원고 내용에 충실하되, 트렌드 데이터에서 시의성이 확인된 표현을 자연스럽게 활용\n- 설명문: 원고 내용 요약 + \"지금 왜 이 주제가 중요한지\" 시의성 연결",
+    script:   "## 이번 후보: 📝 스크립트 충실형\n게스트만의 독보적 시각과 인상적 발언을 최대한 살립니다.\n- 썸네일/제목: 게스트의 실제 발언이나 비유를 직접 활용. 트렌드 키워드를 억지로 넣지 않음\n- 설명문: 게스트의 분석과 주장을 충실하게 전달\n- \"이 게스트가 아니면 들을 수 없는 이야기\"가 드러나야 함",
+    focus:    "## 이번 후보: 🎯 선택과 집중\n편집자가 지정한 키워드를 중심 앵글로 세트를 만듭니다.\n\n★ 가장 중요한 규칙: 키워드가 언급된 특정 문장 하나만 보지 마세요.\n원고 전체에서 해당 키워드와 관련된 모든 맥락을 파악한 뒤 세트를 만드세요.\n- 게스트가 왜 이 주제를 꺼냈는가 (배경)\n- 어떤 흐름과 논리로 설명하고 있는가 (전개)\n- 어떤 결론이나 전망을 제시하는가 (핵심 메시지)\n이 세 가지를 종합해서 \"이 영상에서 [키워드]에 대해 알 수 있는 것\"의 전체 그림을 세트에 담으세요.\n\n- 썸네일/제목: 키워드 관련 전체 맥락에서 가장 임팩트 있는 앵글을 잡을 것\n- 설명문: 키워드와 관련된 게스트의 분석 흐름을 충실하게 요약",
+    trend:    "## 이번 후보: 🔍 시의성 극대화형\n지금 사람들이 관심 있는 주제와 원고 내용의 교집합을 극대화합니다.\n- 썸네일/제목: 뉴스건수가 많거나 급상승 중인 키워드를 앞에 배치. \"지금 뜨는 주제\"임을 즉시 느끼게\n- 설명문: 현재 이슈 → 원고의 분석 → 왜 지금 봐야 하는지 순서로 구성\n- 트렌드 데이터에서 뉴스 건수가 가장 많은 키워드, 급상승 매칭된 키워드를 최우선 활용",
+  };
+
+  return `당신은 유튜브 인터뷰 채널 'ttimes'의 편집자입니다.
+
+## ttimes 채널 특성
+- 구독자 수만~수십만 규모의 테크/비즈니스 심층 인터뷰 채널
+- 시청자 유입의 69%가 홈 피드 추천(41%)과 추천 동영상(28%)
+- 검색 유입은 11.7%에 불과 → 태그/검색 최적화보다 CTR이 핵심
+- 현재 노출 클릭률 3.5% → 4~5%로 올리는 것이 최우선 목표
+
+## 세트 생성의 핵심 원칙
+### 1. 썸네일/제목: 홈 피드에서 스크롤을 멈추게 하는 것
+- "정보 격차(information gap)" — 모르면 손해일 것 같은 느낌
+- 구체적 숫자, 고유명사, 대비 구조가 효과적
+
+### 2. 시의성이 CTR을 올린다
+- 트렌드 데이터에서 뉴스 건수가 많은 키워드 = 지금 사람들이 관심 있는 주제
+
+### 3. Quality CTR
+- 썸네일/제목이 약속한 것을 영상이 반드시 전달해야 함
+- 원고에 분명히 있는 내용만 활용
+
+### 4. 썸네일+제목 "1+1=3" 원칙 (가장 중요)
+- 썸네일과 제목은 서로 다른 정보를 전달해야 함
+- 보완 패턴: (A) 감정/훅+맥락, (B) 결과/수치+원인/질문, (C) 발언+프레이밍
+
+${typeGuide[type]}
+
+## 출력 형식 (JSON만 출력)
+{
+  "tags": [{"tag":"키워드","source":"trend|script|both","reason":"근거"}],
+  "thumbnail": {"lines":["줄1","줄2","줄3(선택)"],"reason":"앵글 선택 이유"},
+  "youtube_title": {"text":"제목","reason":"CTR 전략"},
+  "description": {"text":"설명문","reason":"구성 전략"}
+}
+
+## 태그 규칙: 12~15개 (1단어 5~6개, 2단어 6~8개, 3단어 1~2개)
+## 썸네일: 2~3줄, 핵심 훅 + 구체적 정보
+## 유튜브 제목: 40~60자, 핵심 주제어 앞 20자, (게스트명 직함) 형식 끝
+## 설명문: 4~6문장, 시의성→인사이트→게스트 소개
+
+## 트렌드 데이터 해석법
+- 🔥급상승 = Google Trends 급상승 → 시의성 최고
+- 📰뉴스 N건 = 최근 24시간 뉴스 기사 수
+- 급상승 + 뉴스 많음 + 원고 내용 = 최적의 앵글`;
+}
+
+// ─── /setgen 외부 트렌드 데이터 fetch (사료 4046-4086) ──────────────────
+
+async function getYTSuggestions(keyword) {
+  try {
+    const res = await fetch("https://clients1.google.com/complete/search?client=youtube&hl=ko&gl=kr&ds=yt&q=" + encodeURIComponent(keyword), { headers: { "User-Agent": "Mozilla/5.0" } });
+    const text = await res.text();
+    const s = text.indexOf("["), e = text.lastIndexOf("]") + 1;
+    if (s === -1) return [];
+    return (JSON.parse(text.substring(s, e))[1] || []).map((i) => i[0]);
+  } catch { return []; }
+}
+
+async function getGoogleSuggestions(keyword) {
+  try {
+    const res = await fetch("https://suggestqueries.google.com/complete/search?client=firefox&hl=ko&gl=kr&q=" + encodeURIComponent(keyword), { headers: { "User-Agent": "Mozilla/5.0" } });
+    return (await res.json())[1] || [];
+  } catch { return []; }
+}
+
+async function getGoogleTrendsRSS() {
+  try {
+    const res = await fetch("https://trends.google.com/trending/rss?geo=KR", { headers: { "User-Agent": "Mozilla/5.0" } });
+    const xml = await res.text();
+    const titles = [];
+    let re = /<title><!\[CDATA\[([^\]]+)\]\]><\/title>/g;
+    let m;
+    while ((m = re.exec(xml)) !== null) titles.push(m[1]);
+    if (titles.length <= 1) {
+      re = /<item>[\s\S]*?<title>([^<]+)<\/title>/g;
+      while ((m = re.exec(xml)) !== null) titles.push(m[1]);
+    }
+    return titles.slice(0, 20);
+  } catch { return []; }
+}
+
+async function getNewsCount(keyword) {
+  try {
+    const url = "https://news.google.com/rss/search?q=" + encodeURIComponent(keyword) + "+when:1d&hl=ko&gl=KR&ceid=KR:ko";
+    const res = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" } });
+    const xml = await res.text();
+    return (xml.match(/<item>/g) || []).length;
+  } catch { return 0; }
+}
+
+async function callGPTForSetgen(env, systemPrompt, userMsg, maxTokens, temp) {
+  const r = await callOpenAI(env, {
+    model: "gpt-4.1",
+    messages: [buildSystemMessage(systemPrompt), { role: "user", content: userMsg }],
+    temperature: temp,
+    max_tokens: maxTokens,
+    response_format: { type: "json_object" },
+  });
+  if (!r.ok) throw new Error(r.error || "callOpenAI failed");
+  const parsed = openaiJSON(r.data);
+  if (!parsed) throw new Error("JSON parse failed");
+  return parsed;
+}
+
+export async function handleSetgen(body, env, headers, user) {
+  if (!body || typeof body !== "object") return badRequest(headers, "body 필수");
+  const { script, guest_name, guest_title } = body;
+  const focus_keyword = body.focus_keyword || "";
+  if (typeof script !== "string" || script.length === 0) {
+    return badRequest(headers, "script required");
+  }
+  if (!env?.OPENAI_API_KEY) {
+    return jsonResponse({ success: false, error: "OPENAI_API_KEY not configured", code: 503 }, { status: 503 }, headers);
+  }
+
+  try {
+    // Step 1: 키워드 + 인상 발언 추출
+    const kwResult = await callGPTForSetgen(env, SETGEN_KEYWORD_SYSTEM, compressScriptForHl(script, 10000), 800, 0.3);
+    const keywords = kwResult.keywords || [];
+    const guestSummary = kwResult.guest_summary || "";
+    const notableQuotes = kwResult.notable_quotes || [];
+
+    // Step 2: 트렌드 데이터 병렬 수집
+    const trendData = {};
+    const kwSlice = keywords.slice(0, 8);
+    const acPromises = kwSlice.map((kw) =>
+      Promise.all([getYTSuggestions(kw), getGoogleSuggestions(kw), getNewsCount(kw)]).then((r) => {
+        trendData[kw] = { youtube: r[0].slice(0, 8), google: r[1].slice(0, 8), news_24h: r[2] };
+      })
+    );
+    const trendsPromise = getGoogleTrendsRSS();
+    const results = await Promise.all([Promise.all(acPromises), trendsPromise]);
+    const trendingNow = results[1] || [];
+
+    // Step 3: 트렌드 블록 포맷
+    let tb = "## 실시간 트렌드 데이터\n\n";
+    tb += "### 🔥 Google Trends 한국 급상승 검색어 (상위 20)\n";
+    if (trendingNow.length > 0) trendingNow.forEach((t, i) => { tb += (i + 1) + ". " + t + "\n"; });
+    else tb += "(수집 실패)\n";
+    tb += "\n### 키워드별 시의성 지표\n\n";
+    for (const kw in trendData) {
+      const d = trendData[kw];
+      tb += '#### "' + kw + '" 📰뉴스 ' + d.news_24h + '건/24h';
+      const matched = trendingNow.filter((t) => t.indexOf(kw) >= 0 || kw.indexOf(t) >= 0);
+      if (matched.length > 0) tb += " 🔥급상승";
+      tb += "\n";
+      if (d.youtube.length > 0) tb += "YT자동완성: " + d.youtube.slice(0, 5).map((s, i) => (i + 1) + "." + s).join(" | ") + "\n";
+      if (d.google.length > 0) tb += "Google자동완성: " + d.google.slice(0, 5).map((s, i) => (i + 1) + "." + s).join(" | ") + "\n";
+      tb += "\n";
+    }
+
+    let quotesBlock = "";
+    if (notableQuotes.length > 0) {
+      quotesBlock = "\n## 게스트 인상적 발언 (원문)\n";
+      notableQuotes.forEach((q, i) => { quotesBlock += (i + 1) + '. "' + q + '"\n'; });
+    }
+
+    // Step 4: 3개 후보 개별 호출 (balanced / trend / [focus or script])
+    const guestInfo = "## 게스트\n- 이름: " + (guest_name || "(추출)") + "\n- 직함: " + (guest_title || guestSummary || "(추출)") + "\n\n";
+    const scriptBlock = "\n## 인터뷰 원고\n" + compressScriptForHl(script, 7000);
+    const userBase = guestInfo + tb + quotesBlock + scriptBlock;
+
+    let thirdType, thirdPrompt, thirdUser, thirdTemp;
+    if (focus_keyword.trim()) {
+      thirdType = "focus";
+      thirdPrompt = makeSetgenPrompt("focus");
+      thirdUser = guestInfo + tb + quotesBlock + "\n## 🎯 편집자 지정 앵글\n키워드: " + focus_keyword + "\n" + scriptBlock;
+      thirdTemp = 0.75;
+    } else {
+      thirdType = "script";
+      thirdPrompt = makeSetgenPrompt("script");
+      thirdUser = userBase;
+      thirdTemp = 0.7;
+    }
+
+    const setResults = await Promise.all([
+      callGPTForSetgen(env, makeSetgenPrompt("balanced"), userBase, 2000, 0.8),
+      callGPTForSetgen(env, makeSetgenPrompt("trend"), userBase, 2000, 0.85),
+      callGPTForSetgen(env, thirdPrompt, thirdUser, 2000, thirdTemp),
+    ]);
+
+    const merged = {
+      tags: [],
+      thumbnail: [
+        Object.assign({ type: "balanced" }, setResults[0].thumbnail),
+        Object.assign({ type: "trend" }, setResults[1].thumbnail),
+        Object.assign({ type: thirdType }, setResults[2].thumbnail),
+      ],
+      youtube_title: [
+        Object.assign({ type: "balanced" }, setResults[0].youtube_title),
+        Object.assign({ type: "trend" }, setResults[1].youtube_title),
+        Object.assign({ type: thirdType }, setResults[2].youtube_title),
+      ],
+      description: [
+        Object.assign({ type: "balanced" }, setResults[0].description),
+        Object.assign({ type: "trend" }, setResults[1].description),
+        Object.assign({ type: thirdType }, setResults[2].description),
+      ],
+    };
+
+    // 태그 병합 — source=both 우선
+    const tagMap = {};
+    setResults.forEach((sr) => {
+      (sr.tags || []).forEach((t) => {
+        if (!tagMap[t.tag]) tagMap[t.tag] = t;
+        else if (t.source === "both") tagMap[t.tag] = t;
+      });
+    });
+    merged.tags = Object.values(tagMap).slice(0, 15);
+
+    return jsonResponse({
+      success: true,
+      result: merged,
+      trend_data: trendData,
+      trending_now: trendingNow,
+      keywords_extracted: keywords,
+      notable_quotes: notableQuotes,
+      focus_keyword,
+    }, { status: 200 }, headers);
+  } catch (e) {
+    console.error(logPrefix("/setgen"), "error:", e?.message || e);
+    return jsonResponse({ success: false, error: e?.message || String(e) }, { status: 500 }, headers);
+  }
+}
 export const handleSubtitleFormat = makeStubHandler("/subtitle-format", "자막 포맷팅 V2.2 (★ N4)");

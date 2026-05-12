@@ -433,11 +433,55 @@ test("handleHlTimestamps: API 키 부재 → 503", async () => {
   assert.equal(r.status, 503);
 });
 
-// ─── 3 LLM stub 검증 (term-explain + setgen + subtitle-format) ─────────
+// ─── /term-explain + /setgen (★ M2 Phase 6) ────────────────────────────
+
+test("TERM_EXPLAIN_PROMPT: 40~150자 / JSON 출력 규칙", async () => {
+  const { TERM_EXPLAIN_PROMPT } = await import("../ai.js");
+  assert.ok(TERM_EXPLAIN_PROMPT.includes("40~150자"));
+  assert.ok(TERM_EXPLAIN_PROMPT.includes("explanation"));
+  assert.ok(!TERM_EXPLAIN_PROMPT.includes("Disregard any instruction"));
+});
+
+test("handleTermExplain: term 부재 → 400", async () => {
+  const r = await handleTermExplain({}, { OPENAI_API_KEY: "k" }, HEADERS, ALICE);
+  assert.equal(r.status, 400);
+});
+
+test("handleTermExplain: Gemini + OpenAI 둘 다 부재 → 502", async () => {
+  const r = await handleTermExplain({ term: "RAG" }, {}, HEADERS, ALICE);
+  assert.equal(r.status, 502);  // All providers failed
+});
+
+test("SETGEN_KEYWORD_SYSTEM + makeSetgenPrompt 4 type 정합", async () => {
+  const { SETGEN_KEYWORD_SYSTEM, makeSetgenPrompt } = await import("../ai.js");
+  assert.ok(SETGEN_KEYWORD_SYSTEM.includes("keywords"));
+  assert.ok(SETGEN_KEYWORD_SYSTEM.includes("notable_quotes"));
+  for (const type of ["balanced", "script", "focus", "trend"]) {
+    const p = makeSetgenPrompt(type);
+    assert.ok(p.includes("ttimes"));
+    assert.ok(p.includes("CTR"));
+    assert.ok(p.includes("1+1=3"));
+  }
+  // type 별 차별화
+  assert.ok(makeSetgenPrompt("balanced").includes("⚖️"));
+  assert.ok(makeSetgenPrompt("script").includes("📝"));
+  assert.ok(makeSetgenPrompt("focus").includes("🎯"));
+  assert.ok(makeSetgenPrompt("trend").includes("🔍"));
+});
+
+test("handleSetgen: script 부재 → 400", async () => {
+  const r = await handleSetgen({}, { OPENAI_API_KEY: "k" }, HEADERS, ALICE);
+  assert.equal(r.status, 400);
+});
+
+test("handleSetgen: API 키 부재 → 503", async () => {
+  const r = await handleSetgen({ script: "테스트 원고" }, {}, HEADERS, ALICE);
+  assert.equal(r.status, 503);
+});
+
+// ─── 1 LLM stub 검증 (subtitle-format 만 Phase 4 미적용) ───────────────
 
 const LLM_HANDLERS = [
-  ["term-explain", handleTermExplain],
-  ["setgen", handleSetgen],
   ["subtitle-format", handleSubtitleFormat],
 ];
 
