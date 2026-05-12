@@ -33,7 +33,7 @@ export const TAB_SCHEMAS = Object.freeze({
     required: [],
   },
   subtitle: {
-    fields: ["subtitles", "format"],
+    fields: ["subtitles", "format", "_generatedAt", "_debug"],
     required: [],
   },
   guide: {

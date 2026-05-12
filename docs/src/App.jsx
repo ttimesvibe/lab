@@ -309,6 +309,7 @@ export function App() {
           <TabComponent
             tabId={workerTab}
             data={currentTabData}
+            allTabData={tabData}
             onSave={(newData) => handleTabSave(workerTab, newData)}
             onMultiSave={handleMultiTabSave}
             sessionId={sessionId}
