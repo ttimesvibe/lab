@@ -21,7 +21,7 @@ export const TAB_KEYS = Object.freeze([
 
 export const TAB_MAP = Object.freeze({
   meta:       { worker: "meta",       ui: null,         step: null, dirtyKey: null,         persist: true,  internal: true },
-  manuscript: { worker: "manuscript", ui: null,         step: null, dirtyKey: "manuscript", persist: true,  internal: true },
+  manuscript: { worker: "manuscript", ui: "manuscript", step: null, dirtyKey: "manuscript", persist: true,  internal: false },
   review:     { worker: "review",     ui: "review",     step: 0,    dirtyKey: "review",     persist: true,  internal: false },
   correction: { worker: "correction", ui: "correction", step: 1,    dirtyKey: "correction", persist: true,  internal: false },
   // ★ subtitle worker 키 = /subtitle-format LLM 결과. UI "script" 탭은 correction.scriptEdits 동봉.
@@ -36,8 +36,10 @@ export const TAB_MAP = Object.freeze({
 
 // ─── UI 매핑 ────────────────────────────────────────────────────────────
 
-// 8 user-facing tabs (Dashboard.jsx STEP_LABELS, S2.2'.6)
+// 9 user-facing tabs (★ 실 UI Phase 1: manuscript 노출, 원고 업로드 진입점)
+//   manuscript 는 step null — 0차 검토 (review) 이전 단계
 export const UI_TABS = Object.freeze([
+  "manuscript",
   "review", "correction", "script", "guide",
   "visual", "modify", "highlight", "setgen",
 ]);

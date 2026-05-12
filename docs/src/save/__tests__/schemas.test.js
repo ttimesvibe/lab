@@ -38,11 +38,13 @@ test("TAB_MAP: 11 탭 모두 metadata 정의", () => {
   }
 });
 
-test("UI_TABS: 8 user-facing", () => {
-  assert.equal(UI_TABS.length, 8);
-  for (const u of ["review", "correction", "script", "guide", "visual", "modify", "highlight", "setgen"]) {
+test("UI_TABS: 9 user-facing (★ 실 UI Phase 1 — manuscript 노출)", () => {
+  assert.equal(UI_TABS.length, 9);
+  for (const u of ["manuscript", "review", "correction", "script", "guide", "visual", "modify", "highlight", "setgen"]) {
     assert.ok(UI_TABS.includes(u));
   }
+  // manuscript 가 첫 번째 (원고 업로드 진입점)
+  assert.equal(UI_TABS[0], "manuscript");
 });
 
 test("STEP_TO_TAB: step 2 (UI script) → worker subtitle (★ PRD §12.1)", () => {

@@ -208,6 +208,17 @@ export function App() {
     }
   }, []);
 
+  // ★ 실 UI Phase 1: 다중 탭 동시 갱신 (ManuscriptTab 업로드 → manuscript + review)
+  const handleMultiTabSave = useCallback((updates) => {
+    if (!updates || typeof updates !== "object") return;
+    setTabData((prev) => ({ ...prev, ...updates }));
+    if (engineRef.current) {
+      for (const tab of Object.keys(updates)) {
+        engineRef.current.markDirty(tab);
+      }
+    }
+  }, []);
+
   const handleUiTabChange = useCallback(async (newUiTab) => {
     setCurrentUiTab(newUiTab);
     const workerTab = uiToWorker(newUiTab);
@@ -299,6 +310,7 @@ export function App() {
             tabId={workerTab}
             data={currentTabData}
             onSave={(newData) => handleTabSave(workerTab, newData)}
+            onMultiSave={handleMultiTabSave}
             sessionId={sessionId}
             config={config}
             currentTab={workerTab}
