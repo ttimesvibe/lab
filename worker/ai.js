@@ -1875,4 +1875,719 @@ export async function handleSetgen(body, env, headers, user) {
     return jsonResponse({ success: false, error: e?.message || String(e) }, { status: 500 }, headers);
   }
 }
-export const handleSubtitleFormat = makeStubHandler("/subtitle-format", "자막 포맷팅 V2.2 (★ N4)");
+// ─── /subtitle-format (★ M2 Phase 4 — V2.2 + V3, N4 PROMPT_INJECTION_GUARD) ──
+// 사료: editor/worker/index.js:2747-3569 (prod V2.1/V3 prompt + post-processing)
+// 변경점:
+//   - PROMPT_INJECTION_GUARD interpolation 제거 → buildSystemMessage prepend
+//   - 직접 fetch → callOpenAI 경유 (일관성)
+//   - model "gpt-5.4-mini" 보존 (사용자 환경 별칭)
+
+export const SUBTITLE_FORMAT_PROMPT = `<role>
+You are a Korean subtitle line-break position expert. You receive Korean interview transcript text with numbered words (eojeols). Your ONLY job is to decide WHERE to place line breaks by returning the word numbers. You do NOT rewrite, modify, or reproduce any of the original text.
+</role>
+
+<task>
+Given numbered words like: [1]거기서 [2]광고 [3]매출 [4]잘 [5]나오고 [6]있으니까
+Return ONLY the word numbers AFTER which a line break should be placed.
+Output: {"breaks_after": [6]}
+This means: break after word 6 → line 1 = words 1–6, line 2 starts at word 7.
+</task>
+
+<decision_criteria>
+Your decisions must follow this priority order:
+
+PRIORITY 1 — Never split semantic chunks (see <never_split>)
+PRIORITY 2 — Break at clause boundaries (see <clause_boundaries>)
+PRIORITY 3 — Every line SHOULD be between 12 and 28 characters.
+HARD LIMIT: No line may exceed 35 characters under any circumstance.
+If keeping a semantic chunk intact would produce a line over 35 characters, you MUST find a break point inside that chunk — even semantic chunks can be split when they exceed 35 characters.
+
+MINIMUM BREAK DENSITY: For every 5 words in the input, there must be at least 1 break.
+A 50-word input must have at least 10 breaks.
+A 60-word input must have at least 12 breaks.
+If your output has fewer breaks than this minimum, you are making lines too long.
+
+When PRIORITY 2 and 3 conflict:
+- If a clause boundary produces a line over 28 characters → you MUST find an additional break point inside that clause. Look for internal phrase boundaries (object+verb, adverb+predicate, list items).
+- If a clause boundary produces a line under 12 characters → acceptable ONLY if the line is a semantically complete unit (direct speech, exclamation, or a standalone clause ending). Otherwise merge with adjacent line.
+
+CRITICAL RULE: A line over 35 characters is ALWAYS wrong, no matter what. When you see 5+ words accumulating without a break, you are probably making a line too long. Break it.
+</decision_criteria>
+
+<line_length_guide>
+Korean eojeols average about 3–4 characters each (including the trailing space).
+Use this rough mapping to stay within 12–28 characters per line:
+
+| Words in line | Approximate chars | Verdict      |
+|---------------|-------------------|--------------|
+| 2–3 words     | 8–15 chars        | Short — OK only if semantically complete |
+| 4–5 words     | 14–22 chars       | Ideal range  |
+| 6–7 words     | 20–28 chars       | Upper limit — check carefully |
+| 8+ words      | 28+ chars         | TOO LONG — must break somewhere inside |
+
+When you have 7+ words between breaks, STOP and look for an internal break point.
+</line_length_guide>
+
+<clause_boundaries>
+These are natural break points in Korean speech.
+
+Break AFTER words ending with these suffixes:
+~하고, ~해서, ~인데, ~지만, ~니까, ~있고, ~거든요, ~잖아요, ~됐고, ~보니까, ~계세요, ~는데, ~때문에, ~합니다, ~돼요, ~거고, ~이고, ~하는, ~됩니다, ~있어요, ~거예요, ~하죠, ~되고
+
+Break BEFORE these conjunctions (they start a new line):
+그래서, 그리고, 하지만, 결국, 심지어, 특히, 마찬가지로, 근데, 그러니까, 그런데, 그러면, 그러다, 그런
+
+Break BEFORE direct speech (quoted utterances start a new line).
+</clause_boundaries>
+
+<semantic_chunks>
+A semantic chunk is a group of words forming ONE meaning unit. Never place a break inside a chunk.
+
+| Chunk Type                    | Example (keep together)       |
+|-------------------------------|-------------------------------|
+| Subject/Topic + Particle      | 사용자의 역량이                |
+| Modifier clause + Head noun   | 돌아가고 있는 곳들이            |
+| Adverb(ial phrase) + Predicate| 많이 쓸수록                    |
+| Object + Predicate            | 토큰을 생산할                  |
+| Main verb + Aux verb + Ending | 나오고 있으니까                |
+| Noun + Particle               | 사용자의 (사용자 / 의 = ERROR) |
+</semantic_chunks>
+
+<never_split>
+Breaking inside ANY of these patterns is a critical error.
+
+| Pattern Type                  | Keep Together            | WRONG Split              |
+|-------------------------------|--------------------------|--------------------------|
+| Modifier clause + Head noun   | 돌아가고 있는 곳들이       | 돌아가고 있는 / 곳들이     |
+| Object + Predicate            | 토큰을 많이 쓸수록        | 토큰을 많이 / 쓸수록      |
+| Main verb + Auxiliary verb    | 나오고 있으니까           | 나오고 / 있으니까         |
+| Adverb + Verb                 | 꽤 돌아가고              | 꽤 / 돌아가고            |
+| Noun + Particle               | 사용자의                 | 사용자 / 의              |
+| Orphaned single word on a line | (never allowed)         |                          |
+</never_split>
+
+<examples>
+
+<example id="1">
+<input>
+[1]마찬가지로 [2]워크 [3]에이전트도 [4]사용자의 [5]역량이 [6]중요합니다 [7]회사 [8]데이터를 [9]다 [10]주고 [11]예를 [12]들면 [13]인사 [14]규정 [15]다 [16]주고 [17]제가 [18]한 [19]줄로 [20]물어봐요 [21]나 [22]내일 [23]집에 [24]가도 [25]돼? [26]이러면 [27]답을 [28]할 [29]수가 [30]없죠 [31]이게 [32]도대체 [33]무슨 [34]뜻인데요
+</input>
+<correct_output>{"breaks_after": [3, 6, 12, 20, 25, 30]}</correct_output>
+</example>
+
+<example id="2">
+<input>
+[1]거기서 [2]광고 [3]매출 [4]잘 [5]나오고 [6]있으니까 [7]그런 [8]거에 [9]장점은 [10]있지만 [11]결국 [12]아마존 [13]마이크로소프트 [14]구글 [15]애플은 [16]토큰을 [17]많이 [18]쓸수록 [19]회사가 [20]좋아지는 [21]회사가 [22]되려고 [23]하고 [24]있고
+</input>
+<correct_output>{"breaks_after": [6, 10, 13, 18, 21]}</correct_output>
+<wrong_output reason="Line too long — no break between [11] and [24] produces 44ch line">
+breaks_after: [6, 10] → 44ch = CRITICAL ERROR
+</wrong_output>
+</example>
+
+<example id="3">
+<input>
+[1]1년 [2]만에 [3]30년 [4]개발자 [5]기업 [6]분석 [7]시리즈를 [8]저희가 [9]다시 [10]시작해서 [11]지금 [12]이어가고 [13]있는데 [14]일단 [15]토큰을 [16]중심으로 [17]하는 [18]토큰 [19]이코노미가 [20]굉장히 [21]중요하다고 [22]말씀해 [23]주셨고 [24]코딩 [25]에이전트는 [26]이미 [27]다 [28]보급돼서 [29]우리가 [30]잘 [31]쓰고 [32]있고
+</input>
+<correct_output>{"breaks_after": [7, 13, 19, 23, 28]}</correct_output>
+</example>
+
+<example id="4">
+<input>
+[1]이 [2]사람들이 [3]하는 [4]일을 [5]어떻게 [6]AI로 [7]잘할 [8]것인가라고 [9]해서 [10]일반 [11]직군 [12]AX를 [13]하고 [14]있는데 [15]일반 [16]직군 [17]AX의 [18]제일 [19]중요한 [20]게 [21]이 [22]워크 [23]에이전트라고 [24]보고 [25]있습니다
+</input>
+<correct_output>{"breaks_after": [9, 14, 20]}</correct_output>
+<wrong_output reason="No internal breaks — single 46ch line">
+breaks_after: [] → 46ch = CRITICAL ERROR
+</wrong_output>
+</example>
+
+</examples>
+
+<output_format>
+Return ONLY valid JSON. Nothing before or after.
+{"breaks_after": [3, 6, 12, 20, 25, 30]}
+
+The numbers are word indices AFTER which a line break is inserted.
+Do NOT include the last word's index (no trailing break).
+Do NOT output any text, explanation, or markdown — JSON only.
+
+Before outputting the JSON, silently verify:
+1. Count your breaks. For N input words, you need at least N/5 breaks.
+2. Check: is there any gap of 8+ word indices between consecutive breaks? If yes, add a break in that gap.
+3. Only then output the final JSON.
+</output_format>`;
+
+export const SUBTITLE_FORMAT_PROMPT_V3 = `<role>
+You are a Korean subtitle line-break formatter. Your job is to split Korean interview transcripts into subtitle lines that viewers can read at a glance. You must maintain consistent quality from the first line to the last, regardless of input length.
+</role>
+
+<hard_rules>
+These rules apply to EVERY line with NO exceptions:
+1. Every output line must be 15–25 characters (including spaces).
+2. Lines under 10 characters → FAILURE. Lines over 25 characters → FAILURE.
+3. Remove trailing periods (.) and commas (,). Preserve ? and !
+4. Remove metadata lines (filenames, dates, durations, speaker labels, dividers).
+5. Output the formatted text only — one subtitle line per line, no numbering, no explanations.
+6. After the formatted lines, output NOTHING else.
+</hard_rules>
+
+<speaker_markers>
+Input text contains [화자명] markers at the start of each speaker turn.
+- ALWAYS start a new line after each [화자명] marker.
+- NEVER merge text from different speakers into one line.
+- Remove the [화자명] markers from your output — they are only for your reference.
+</speaker_markers>
+
+<process>
+Follow this exact sequence for every input:
+
+STEP 1 — FOR THE INPUT:
+
+  1a. Mark clause boundaries
+  Clause-ending suffixes (break AFTER these):
+  ~하고, ~해서, ~인데, ~지만, ~니까, ~있고, ~거든요, ~잖아요, ~됐고, ~보니까, ~계세요
+
+  Conjunctions (break BEFORE these — they start a new line):
+  그래서, 그리고, 하지만, 결국, 심지어, 특히, 마찬가지로
+
+  1b. Identify semantic chunks within each clause
+  A semantic chunk is a group of words forming ONE idea:
+  - [Subject/Topic + Particle]: 사용자의 역량이
+  - [Modifier clause + Head noun]: 돌아가고 있는 곳들이
+  - [Adverb(ial phrase) + Predicate]: 많이 쓸수록
+  - [Object + Predicate]: 토큰을 생산할
+  - [Main verb + Auxiliary verb + Ending]: 나오고 있으니까
+
+  1c. Place line breaks BETWEEN semantic chunks, never inside them.
+  Choose the break point closest to the 15–25 character target.
+
+  1d. VALIDATE every line.
+  Count characters. If any line is < 15 or > 25, fix it NOW before outputting.
+
+STEP 2 — FINAL VALIDATION
+Do a final character-count check on the entire output.
+</process>
+
+<never_split>
+The following patterns must ALWAYS stay on a single line. Breaking inside them is a critical error.
+
+| Pattern Type                  | Keep Together            | WRONG Split              |
+|-------------------------------|--------------------------|--------------------------|
+| Modifier clause + Head noun   | 돌아가고 있는 곳들이       | 돌아가고 있는 / 곳들이     |
+| Object + Predicate            | 토큰을 많이 쓸수록        | 토큰을 많이 / 쓸수록      |
+| Main verb + Auxiliary verb    | 나오고 있으니까           | 나오고 / 있으니까         |
+| Adverb + Verb                 | 꽤 돌아가고              | 꽤 / 돌아가고            |
+| Noun + Particle               | 사용자의                 | 사용자 / 의              |
+| Orphaned single word on a line | (never allowed)         |                          |
+</never_split>
+
+<examples>
+
+<example id="1">
+<description>Mixed sentence types: statement, direct speech with ?, and short clauses. Shows conjunction-start rule, quote handling, and semantic unit preservation.</description>
+
+<input>마찬가지로 워크 에이전트도 사용자의 역량이 중요합니다 회사 데이터를 다 주고 예를 들면 인사 규정 다 주고 제가 한 줄로 물어봐요 나 내일 집에 가도 돼? 이러면 답을 할 수가 없죠 이게 도대체 무슨 뜻인데요</input>
+
+<correct_output>
+마찬가지로 워크 에이전트도
+사용자의 역량이 중요합니다
+회사 데이터를 다 주고 예를 들면
+인사 규정 다 주고 제가 한 줄로 물어봐요
+나 내일 집에 가도 돼?
+이러면 답을 할 수가 없죠
+이게 도대체 무슨 뜻인데요
+</correct_output>
+
+<line_by_line_analysis>
+Line 1: "마찬가지로 워크 에이전트도" (15ch) — Conjunction starts the line
+Line 2: "사용자의 역량이 중요합니다" (15ch) — [Subject+Particle] + [Predicate] complete clause
+Line 3: "회사 데이터를 다 주고 예를 들면" (18ch) — Clause ending ~주고 + transitional
+Line 4: "인사 규정 다 주고 제가 한 줄로 물어봐요" (22ch) — Clause ending ~주고 + new subject
+Line 5: "나 내일 집에 가도 돼?" (15ch) — Direct speech with ? preserved
+Line 6: "이러면 답을 할 수가 없죠" (15ch) — [Object+Predicate] kept intact
+Line 7: "이게 도대체 무슨 뜻인데요" (15ch) — [Adverb+Predicate] kept intact
+</line_by_line_analysis>
+</example>
+
+<example id="2">
+<description>Long compound sentence with proper nouns and nested modifier clause. Demonstrates never_split rules.</description>
+
+<input>거기서 광고 매출 잘 나오고 있으니까 그런 거에 장점은 있지만 결국 아마존 마이크로소프트 구글 애플은 결국 토큰을 많이 쓸수록 회사가 좋아지는 회사가 되려고 하고 있고</input>
+
+<correct_output>
+거기서 광고 매출 잘 나오고 있으니까
+그런 거에 장점은 있지만
+결국 아마존 마이크로소프트
+구글 애플은 토큰을 많이 쓸수록
+회사가 좋아지는 회사가
+되려고 하고 있고
+</correct_output>
+
+<line_by_line_analysis>
+Line 1: "거기서 광고 매출 잘 나오고 있으니까" (20ch) — [Main verb + Auxiliary verb] kept intact
+Line 2: "그런 거에 장점은 있지만" (14ch) — Clause ending ~지만
+Line 3: "결국 아마존 마이크로소프트" (15ch) — Conjunction starts new line
+Line 4: "구글 애플은 토큰을 많이 쓸수록" (17ch) — [Object + Predicate] kept intact
+Line 5: "회사가 좋아지는 회사가" (13ch) — [Modifier clause + Head noun] kept intact
+Line 6: "되려고 하고 있고" (10ch) — [Main verb + Auxiliary verb + Ending] kept intact
+</line_by_line_analysis>
+
+<wrong_output reason="Splits [Main verb + Auxiliary verb]">
+거기서 광고 매출 잘 나오고
+있으니까 그런 거에 장점은 있지만
+</wrong_output>
+
+<wrong_output reason="Splits [Object + Predicate]">
+구글 애플은 토큰을 많이
+쓸수록 회사가 좋아지는 회사가
+</wrong_output>
+
+<wrong_output reason="Splits [Modifier clause + Head noun]">
+회사가 좋아지는
+회사가 되려고 하고 있고
+</wrong_output>
+</example>
+
+</examples>
+
+<quote_rules>
+- When quoted speech ('...' or "...") spans multiple lines, repeat the quote marks on each line.
+- Direct speech always starts a new line.
+</quote_rules>
+
+<quality_reminder>
+Read this before processing EACH chunk:
+- Line 300 must be the same quality as line 1.
+- Every line: 15–25 characters. Count them.
+- Never split semantic chunks. Break only BETWEEN meaning units.
+- If you feel yourself rushing, SLOW DOWN and re-validate.
+</quality_reminder>`;
+
+// ─── V2 전처리 (사료 2887-2926) ────────────────────────────────────────
+
+export function preprocessForV2(rawText) {
+  let text = rawText
+    .replace(/^[-=─]{3,}$/gm, "")
+    .replace(/^\d{6}_[^\n]+$/gm, "")
+    .replace(/^\d{1,2}:\d{2}(:\d{2})?$/gm, "")
+    .replace(/^\d+분\s*\d+초?$/gm, "")
+    .replace(/^(싱크|녹취|편|장)\s*[:：].*$/gm, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+  const words = text.split(/\s+/).filter((w) => w.length > 0);
+  const numbered = words.map((w, i) => `[${i + 1}]${w}`).join(" ");
+  return { words, numbered, totalWords: words.length };
+}
+
+export function chunkWords(words, targetSize = 80) {
+  const SENTENCE_ENDINGS = /[.?!]$/;
+  const CLAUSE_ENDINGS = /(니다|어요|거든요|잖아요|는데요|네요|세요|죠|고요)$/;
+  const chunks = [];
+  let start = 0;
+  while (start < words.length) {
+    let end = Math.min(start + targetSize, words.length);
+    if (end < words.length) {
+      let bestBreak = -1;
+      const searchStart = Math.max(start, start + Math.floor(targetSize * 0.8));
+      const searchEnd = Math.min(words.length, start + Math.floor(targetSize * 1.2));
+      for (let i = searchEnd - 1; i >= searchStart; i--) {
+        if (SENTENCE_ENDINGS.test(words[i]) || CLAUSE_ENDINGS.test(words[i])) {
+          bestBreak = i + 1;
+          break;
+        }
+      }
+      if (bestBreak > 0) end = bestBreak;
+    }
+    const chunkW = words.slice(start, end);
+    const numbered = chunkW.map((w, i) => `[${start + i + 1}]${w}`).join(" ");
+    chunks.push({ words: chunkW, numbered, globalOffset: start });
+    start = end;
+  }
+  return chunks;
+}
+
+// ─── V2 후처리 엔진 (사료 2928-3105) ────────────────────────────────────
+
+const V2_MIN_CHARS = 12;
+const V2_MAX_CHARS = 28;
+const V2_HARD_LIMIT = 35;
+
+export function buildLinesV2(words, breaksAfter) {
+  const breakSet = new Set(breaksAfter);
+  const lines = [];
+  let currentWords = [];
+  for (let i = 0; i < words.length; i++) {
+    currentWords.push(words[i]);
+    if (breakSet.has(i + 1) || i === words.length - 1) {
+      const text = currentWords.join(" ");
+      lines.push({ text, words: [...currentWords] });
+      currentWords = [];
+    }
+  }
+  return lines;
+}
+
+async function validateAndResplit(lines, env) {
+  const MAX_RETRIES = 2;
+  let resplitCount = 0;
+  const resplitLines = [];
+
+  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    const violations = [];
+    for (let i = 0; i < lines.length; i++) {
+      if (lines[i].text.length > V2_HARD_LIMIT) violations.push(i);
+    }
+    if (violations.length === 0) break;
+
+    for (let vi = violations.length - 1; vi >= 0; vi--) {
+      const idx = violations[vi];
+      const start = Math.max(0, idx - 1);
+      const end = Math.min(lines.length - 1, idx + 1);
+      const contextLines = lines.slice(start, end + 1);
+      const contextWords = contextLines.flatMap((l) => l.words);
+      const numbered = contextWords.map((w, i) => `[${i + 1}]${w}`).join(" ");
+
+      resplitCount++;
+      resplitLines.push(idx);
+
+      const r = await callOpenAI(env, {
+        model: "gpt-5.4-mini",
+        messages: [buildSystemMessage(SUBTITLE_FORMAT_PROMPT), { role: "user", content: numbered }],
+        temperature: 0.1,
+        max_tokens: 500,
+        response_format: { type: "json_object" },
+      });
+      if (r.ok) {
+        const parsed = openaiJSON(r.data);
+        if (parsed && Array.isArray(parsed.breaks_after)) {
+          const newBreaks = parsed.breaks_after.filter((n) => typeof n === "number" && n >= 1 && n < contextWords.length);
+          const newLines = buildLinesV2(contextWords, newBreaks);
+          lines.splice(start, end - start + 1, ...newLines);
+        }
+      }
+    }
+  }
+
+  // 최후 fallback: 35ch 초과 남으면 중간 강제 분할
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].text.length > V2_HARD_LIMIT) {
+      const ws = lines[i].words;
+      const mid = Math.floor(ws.length / 2);
+      const line1 = { text: ws.slice(0, mid).join(" "), words: ws.slice(0, mid) };
+      const line2 = { text: ws.slice(mid).join(" "), words: ws.slice(mid) };
+      lines.splice(i, 1, line1, line2);
+    }
+  }
+  return { lines, resplitCount, resplitLines };
+}
+
+export function mergeShortLines(lines) {
+  const result = [];
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (line.words.length <= 1 || line.text.length < V2_MIN_CHARS) {
+      // 앞줄과 시도
+      if (result.length > 0) {
+        const prev = result[result.length - 1];
+        const mergedWithPrev = prev.text + " " + line.text;
+        if (mergedWithPrev.length <= V2_MAX_CHARS) {
+          result[result.length - 1] = { text: mergedWithPrev, words: [...prev.words, ...line.words] };
+          continue;
+        }
+      }
+      // 다음 줄과 시도
+      if (i + 1 < lines.length) {
+        const next = lines[i + 1];
+        const mergedWithNext = line.text + " " + next.text;
+        if (mergedWithNext.length <= V2_MAX_CHARS) {
+          result.push({ text: mergedWithNext, words: [...line.words, ...next.words] });
+          i++;
+          continue;
+        }
+      }
+    }
+    result.push(line);
+  }
+  return result;
+}
+
+export function removeTrailingPunctuation(lines) {
+  return lines.map((line) => ({ ...line, text: line.text.replace(/[.,]+$/, "") }));
+}
+
+export function fixQuotesV2(lines) {
+  let inSingle = false, inDouble = false;
+  return lines.map((line) => {
+    let text = line.text;
+    const sc = (text.match(/'/g) || []).length;
+    const dc = (text.match(/"/g) || []).length;
+    if (inSingle && !text.startsWith("'")) text = "'" + text;
+    if (inDouble && !text.startsWith('"')) text = '"' + text;
+    if (sc % 2 === 1) inSingle = !inSingle;
+    if (dc % 2 === 1) inDouble = !inDouble;
+    if (inSingle && !text.endsWith("'")) text = text + "'";
+    if (inDouble && !text.endsWith('"')) text = text + '"';
+    return { ...line, text };
+  });
+}
+
+async function postProcessSubtitleV2(words, breaksAfter, env) {
+  let lines = buildLinesV2(words, breaksAfter);
+  const resplitResult = await validateAndResplit(lines, env);
+  lines = resplitResult.lines;
+  lines = mergeShortLines(lines);
+  lines = removeTrailingPunctuation(lines);
+  lines = fixQuotesV2(lines);
+  return {
+    text: lines.map((l) => l.text).join("\n"),
+    resplitCount: resplitResult.resplitCount,
+    resplitLines: resplitResult.resplitLines,
+    finalLineCount: lines.length,
+  };
+}
+
+// ─── V3 후처리 (사료 3258-3342) ────────────────────────────────────────
+
+async function resplitLongLines(lines, env) {
+  let resplitCount = 0;
+  const result = [];
+  for (const line of lines) {
+    if (line.length <= 35) { result.push(line); continue; }
+    resplitCount++;
+    const r = await callOpenAI(env, {
+      model: "gpt-5.4-mini",
+      messages: [buildSystemMessage(SUBTITLE_FORMAT_PROMPT_V3), { role: "user", content: line }],
+      temperature: 0.1,
+      max_tokens: 1000,
+    });
+    if (r.ok) {
+      const text = (openaiText(r.data) || "").trim();
+      const newLines = text.split("\n").filter((l) => l.trim());
+      if (newLines.length > 1) { result.push(...newLines); continue; }
+    }
+    result.push(line);
+  }
+  return { lines: result, resplitCount };
+}
+
+export function mergeShortLinesSimple(lines) {
+  const result = [];
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    const wordCount = trimmed.split(/\s+/).length;
+    if (wordCount <= 1 || trimmed.length < 10) {
+      if (result.length > 0 && (result[result.length - 1] + " " + trimmed).length <= 28) {
+        result[result.length - 1] += " " + trimmed;
+        continue;
+      }
+      if (i + 1 < lines.length && (trimmed + " " + lines[i + 1].trim()).length <= 28) {
+        result.push(trimmed + " " + lines[i + 1].trim());
+        i++;
+        continue;
+      }
+    }
+    result.push(trimmed);
+  }
+  return result;
+}
+
+export function removeTrailingPuncSimple(lines) {
+  return lines.map((l) => {
+    let s = l.trimEnd();
+    while (s.endsWith(".") || s.endsWith(",")) s = s.slice(0, -1).trimEnd();
+    return s;
+  }).filter((l) => l.length > 0);
+}
+
+export function fixQuotesSimple(lines) {
+  let inSingle = false, inDouble = false;
+  return lines.map((line) => {
+    let text = line;
+    const sc = (text.match(/'/g) || []).length;
+    const dc = (text.match(/"/g) || []).length;
+    if (inSingle && !text.startsWith("'")) text = "'" + text;
+    if (inDouble && !text.startsWith('"')) text = '"' + text;
+    if (sc % 2 === 1) inSingle = !inSingle;
+    if (dc % 2 === 1) inDouble = !inDouble;
+    if (inSingle && !text.endsWith("'")) text = text + "'";
+    if (inDouble && !text.endsWith('"')) text = text + '"';
+    return text;
+  });
+}
+
+/**
+ * /subtitle-format handler — V3 + V2 + V1 하위 호환 3-branch dispatch.
+ *
+ * 사료: editor/worker/index.js:3348-3570 (prod handleSubtitleFormat)
+ *
+ * @param body { version?: "v3"|"v2", text?, words?, blocks? }
+ *   - V3: { version:"v3", text } — 화자 턴 단위, plain text 응답
+ *   - V2: { version:"v2", text(numbered), words } — Word-Index, breaks_after JSON
+ *   - V1: { blocks: [{text}] } — fallback, 자동 청크 + V2 흐름
+ */
+export async function handleSubtitleFormat(body, env, headers, user) {
+  if (!body || typeof body !== "object") return badRequest(headers, "body 필수");
+  if (!env?.OPENAI_API_KEY) {
+    return jsonResponse({ success: false, error: "OPENAI_API_KEY not configured", code: 503 }, { status: 503 }, headers);
+  }
+
+  // ── V3 branch ─────────────────────────────────────────────────────────
+  if (body.version === "v3" && typeof body.text === "string" && body.text.length > 0) {
+    const inputText = body.text;
+    const r = await callOpenAI(env, {
+      model: "gpt-5.4-mini",
+      messages: [buildSystemMessage(SUBTITLE_FORMAT_PROMPT_V3), { role: "user", content: inputText }],
+      temperature: 0.1,
+      max_tokens: 4000,
+    });
+    if (!r.ok) {
+      const status = r.status === 429 ? 429 : (r.status >= 400 ? r.status : 502);
+      return jsonResponse({ success: false, error: r.error || "LLM call failed", _debug: { version: "v3", inputLength: inputText.length } }, { status }, headers);
+    }
+    const rawText = (openaiText(r.data) || "").trim();
+    const finishReason = r.data?.choices?.[0]?.finish_reason;
+    if (!rawText) {
+      return jsonResponse({ success: false, error: "Empty response", _debug: { version: "v3", finishReason } }, { status: 500 }, headers);
+    }
+
+    // 후처리 chain
+    let lines = rawText.split("\n").filter((l) => l.trim());
+    lines = removeTrailingPuncSimple(lines);
+    lines = mergeShortLinesSimple(lines);
+    lines = fixQuotesSimple(lines);
+    const resplitResult = await resplitLongLines(lines, env);
+    lines = resplitResult.lines;
+
+    const formatted = lines.join("\n");
+    const inputClean = inputText.replace(/\s+/g, "");
+    const outputClean = formatted.replace(/[\n\s]+/g, "");
+    const ratio = inputClean.length > 0 ? Math.round((outputClean.length / inputClean.length) * 100) : 100;
+
+    return jsonResponse({
+      success: true,
+      formatted,
+      _debug: {
+        version: "v3",
+        inputLength: inputText.length,
+        outputLength: formatted.length,
+        lineCount: lines.length,
+        ratio,
+        truncated: ratio < 80,
+        resplitCount: resplitResult.resplitCount,
+        finishReason,
+      },
+    }, { status: 200 }, headers);
+  }
+
+  // ── V2 branch ─────────────────────────────────────────────────────────
+  if (body.version === "v2" && typeof body.text === "string" && Array.isArray(body.words)) {
+    const numbered = body.text;
+    const words = body.words;
+    const wordCount = words.length;
+
+    let r = await callOpenAI(env, {
+      model: "gpt-5.4-mini",
+      messages: [buildSystemMessage(SUBTITLE_FORMAT_PROMPT), { role: "user", content: numbered }],
+      temperature: 0.1,
+      max_tokens: 2000,
+      response_format: { type: "json_object" },
+    });
+
+    // 429 1회 재시도
+    if (!r.ok && r.status === 429) {
+      await new Promise((resolve) => setTimeout(resolve, 3000));
+      r = await callOpenAI(env, {
+        model: "gpt-5.4-mini",
+        messages: [buildSystemMessage(SUBTITLE_FORMAT_PROMPT), { role: "user", content: numbered }],
+        temperature: 0.1,
+        max_tokens: 2000,
+        response_format: { type: "json_object" },
+      });
+    }
+    if (!r.ok) {
+      return jsonResponse(
+        { success: false, error: r.error || "LLM call failed", _debug: { wordCount } },
+        { status: r.status >= 400 ? r.status : 502 },
+        headers
+      );
+    }
+
+    const parsed = openaiJSON(r.data);
+    const finishReason = r.data?.choices?.[0]?.finish_reason;
+    let breaksAfter = null;
+    if (parsed && Array.isArray(parsed.breaks_after)) {
+      breaksAfter = parsed.breaks_after.filter((n) => typeof n === "number" && n >= 1 && n < wordCount);
+    }
+    // fallback: 글자수 기반 자동 분할
+    if (!breaksAfter || breaksAfter.length === 0) {
+      breaksAfter = [];
+      let charCount = 0;
+      for (let i = 0; i < words.length - 1; i++) {
+        charCount += words[i].length + 1;
+        if (charCount >= 20) { breaksAfter.push(i + 1); charCount = 0; }
+      }
+    }
+
+    const ppResult = await postProcessSubtitleV2(words, breaksAfter, env);
+    return jsonResponse({
+      success: true,
+      formatted: ppResult.text,
+      _debug: {
+        version: "v2.2-p005",
+        wordCount,
+        breaksCount: breaksAfter.length,
+        breaksAfter,
+        resplitCount: ppResult.resplitCount,
+        resplitLines: ppResult.resplitLines,
+        finalLineCount: ppResult.finalLineCount,
+        outputLength: ppResult.text.length,
+        finishReason,
+      },
+    }, { status: 200 }, headers);
+  }
+
+  // ── V1 하위 호환 branch ─────────────────────────────────────────────────
+  const { blocks } = body;
+  if (!Array.isArray(blocks) || blocks.length === 0) {
+    return badRequest(headers, "text/version or blocks required");
+  }
+
+  const fullText = blocks.map((b) => b.text || "").join("\n");
+  const { words } = preprocessForV2(fullText);
+  const wordChunks = chunkWords(words);
+
+  let allBreaksAfter = [];
+  for (const chunk of wordChunks) {
+    const r = await callOpenAI(env, {
+      model: "gpt-5.4-mini",
+      messages: [buildSystemMessage(SUBTITLE_FORMAT_PROMPT), { role: "user", content: chunk.numbered }],
+      temperature: 0.1,
+      max_tokens: 2000,
+      response_format: { type: "json_object" },
+    });
+    if (r.ok) {
+      const parsed = openaiJSON(r.data);
+      if (parsed && Array.isArray(parsed.breaks_after)) {
+        allBreaksAfter.push(...parsed.breaks_after.filter((n) => typeof n === "number" && n >= 1 && n <= words.length));
+      }
+    }
+  }
+  allBreaksAfter = [...new Set(allBreaksAfter)].sort((a, b) => a - b);
+  if (allBreaksAfter.length === 0) {
+    let cc = 0;
+    for (let i = 0; i < words.length - 1; i++) {
+      cc += words[i].length + 1;
+      if (cc >= 20) { allBreaksAfter.push(i + 1); cc = 0; }
+    }
+  }
+
+  const ppResult = await postProcessSubtitleV2(words, allBreaksAfter, env);
+  return jsonResponse(
+    { success: true, formatted: ppResult.text, blocks: [{ index: 0, text: ppResult.text }] },
+    { status: 200 },
+    headers
+  );
+}

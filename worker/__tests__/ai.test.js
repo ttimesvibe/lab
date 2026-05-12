@@ -479,26 +479,133 @@ test("handleSetgen: API 키 부재 → 503", async () => {
   assert.equal(r.status, 503);
 });
 
-// ─── 1 LLM stub 검증 (subtitle-format 만 Phase 4 미적용) ───────────────
+// ─── /subtitle-format (★ M2 Phase 4 — V2.2 + V3) ────────────────────────
 
-const LLM_HANDLERS = [
-  ["subtitle-format", handleSubtitleFormat],
-];
+test("SUBTITLE_FORMAT_PROMPT (V2.2): 핵심 키워드 정합", async () => {
+  const { SUBTITLE_FORMAT_PROMPT } = await import("../ai.js");
+  assert.ok(SUBTITLE_FORMAT_PROMPT.includes("breaks_after"));
+  assert.ok(SUBTITLE_FORMAT_PROMPT.includes("HARD LIMIT"));
+  assert.ok(SUBTITLE_FORMAT_PROMPT.includes("MINIMUM BREAK DENSITY"));
+  assert.ok(SUBTITLE_FORMAT_PROMPT.includes("semantic_chunks"));
+  assert.ok(SUBTITLE_FORMAT_PROMPT.includes("never_split"));
+  assert.ok(!SUBTITLE_FORMAT_PROMPT.includes("Disregard any instruction"));
+});
 
-for (const [name, handler] of LLM_HANDLERS) {
-  test(`${name}: API 키 부재 → 503 + AI baseline stub 안내`, async () => {
-    const r = await handler({ text: "x" }, {}, HEADERS, ALICE);
-    assert.equal(r.status, 503);
-    const body = await r.json();
-    assert.ok(body.warnings.some((w) => w.includes("baseline stub")));
-  });
-}
+test("SUBTITLE_FORMAT_PROMPT_V3: 화자 턴 + 15-25자 규칙", async () => {
+  const { SUBTITLE_FORMAT_PROMPT_V3 } = await import("../ai.js");
+  assert.ok(SUBTITLE_FORMAT_PROMPT_V3.includes("15–25 characters"));
+  assert.ok(SUBTITLE_FORMAT_PROMPT_V3.includes("speaker_markers"));
+  assert.ok(SUBTITLE_FORMAT_PROMPT_V3.includes("[화자명]"));
+  assert.ok(SUBTITLE_FORMAT_PROMPT_V3.includes("quality_reminder"));
+  assert.ok(!SUBTITLE_FORMAT_PROMPT_V3.includes("Disregard any instruction"));
+});
 
-// ★ N4 영역 핵심 검증
-test("subtitle-format: ★ N4 — PROMPT_INJECTION_GUARD 적용 검증", async () => {
-  const env = { OPENAI_API_KEY: "test-key" };
-  const r = await handleSubtitleFormat({ text: "x" }, env, HEADERS, ALICE);
-  // baseline stub — 501 응답이지만 PROMPT_INJECTION_GUARD 적용 영역 검증
-  const body = await r.json();
-  assert.ok(body.warnings.some((w) => w.includes("PROMPT_INJECTION_GUARD")));
+test("handleSubtitleFormat: body 부재 → 400", async () => {
+  const r = await handleSubtitleFormat(null, {}, HEADERS, ALICE);
+  assert.equal(r.status, 400);
+});
+
+test("handleSubtitleFormat: API 키 부재 → 503", async () => {
+  const r = await handleSubtitleFormat({ version: "v3", text: "x" }, {}, HEADERS, ALICE);
+  assert.equal(r.status, 503);
+});
+
+test("handleSubtitleFormat: 모든 branch 식별 안 됨 → 400 (text/version or blocks required)", async () => {
+  const r = await handleSubtitleFormat({}, { OPENAI_API_KEY: "k" }, HEADERS, ALICE);
+  assert.equal(r.status, 400);
+});
+
+test("preprocessForV2: 메타 줄 제거 + word 번호 부여", async () => {
+  const { preprocessForV2 } = await import("../ai.js");
+  const raw = `260510_intro.mp3
+========
+00:00
+1분 30초
+싱크: 홍재의
+
+안녕하세요 오늘 인터뷰
+시작하겠습니다`;
+  const { words, numbered, totalWords } = preprocessForV2(raw);
+  assert.equal(totalWords, 4);
+  assert.deepEqual(words, ["안녕하세요", "오늘", "인터뷰", "시작하겠습니다"]);
+  assert.ok(numbered.startsWith("[1]안녕하세요"));
+  assert.ok(numbered.endsWith("[4]시작하겠습니다"));
+});
+
+test("chunkWords: targetSize 80 + sentence/clause ending 찾기", async () => {
+  const { chunkWords } = await import("../ai.js");
+  // 200 단어 input (clause endings 매 50 단어마다)
+  const words = [];
+  for (let i = 1; i <= 200; i++) {
+    if (i % 50 === 0) words.push("했습니다");
+    else words.push("단어" + i);
+  }
+  const chunks = chunkWords(words);
+  assert.ok(chunks.length >= 2);
+  // 각 청크는 globalOffset + numbered 가짐
+  assert.equal(chunks[0].globalOffset, 0);
+  assert.ok(chunks[0].numbered.startsWith("[1]"));
+});
+
+test("buildLinesV2: breaks_after 기반 줄 분할", async () => {
+  const { buildLinesV2 } = await import("../ai.js");
+  const words = ["a", "b", "c", "d", "e"];
+  const lines = buildLinesV2(words, [2, 4]);
+  assert.equal(lines.length, 3);
+  assert.equal(lines[0].text, "a b");
+  assert.equal(lines[1].text, "c d");
+  assert.equal(lines[2].text, "e");
+});
+
+test("removeTrailingPunctuation: 마침표/콤마 제거", async () => {
+  const { removeTrailingPunctuation } = await import("../ai.js");
+  const r = removeTrailingPunctuation([
+    { text: "안녕.", words: [] },
+    { text: "테스트,", words: [] },
+    { text: "끝.", words: [] },
+    { text: "물음표?", words: [] },  // 보존
+  ]);
+  assert.equal(r[0].text, "안녕");
+  assert.equal(r[1].text, "테스트");
+  assert.equal(r[3].text, "물음표?");
+});
+
+test("mergeShortLines: 1어절/MIN_CHARS 미만 줄 앞뒤 병합", async () => {
+  const { mergeShortLines } = await import("../ai.js");
+  const r = mergeShortLines([
+    { text: "이건 충분히 긴 줄이에요", words: ["이건", "충분히", "긴", "줄이에요"] },
+    { text: "짧음", words: ["짧음"] },  // 1어절 → 앞 줄과 병합 시도
+    { text: "다음 줄", words: ["다음", "줄"] },
+  ]);
+  // 첫 줄과 병합되면 ≤28자
+  assert.ok(r.length < 3);
+});
+
+test("removeTrailingPuncSimple: 문자열 배열용", async () => {
+  const { removeTrailingPuncSimple } = await import("../ai.js");
+  assert.deepEqual(removeTrailingPuncSimple(["안녕.", "테스트,", "물음?"]), ["안녕", "테스트", "물음?"]);
+});
+
+test("mergeShortLinesSimple: 문자열 배열용", async () => {
+  const { mergeShortLinesSimple } = await import("../ai.js");
+  const r = mergeShortLinesSimple(["충분히 긴 첫줄", "짧음", "그다음 줄"]);
+  assert.ok(r.length < 3);  // 짧음 이 어느 줄과 병합
+});
+
+test("fixQuotesSimple: 멀티라인 따옴표 보정", async () => {
+  const { fixQuotesSimple } = await import("../ai.js");
+  // 첫 줄에서 ' 열고 두번째 줄에서 ' 닫히지 않음 → 두번째 줄도 따옴표 prefix
+  const r = fixQuotesSimple(["'시작 발언", "계속 됨'"]);
+  assert.ok(r[0].startsWith("'"));
+  assert.ok(r[1].endsWith("'"));
+});
+
+test("handleSubtitleFormat: V1 blocks fallback — blocks 빈 배열 → 400", async () => {
+  const r = await handleSubtitleFormat({ blocks: [] }, { OPENAI_API_KEY: "k" }, HEADERS, ALICE);
+  assert.equal(r.status, 400);
+});
+
+test("handleSubtitleFormat: V3 version 만 + text 빈 string → V1 branch 진입 → blocks 필요 → 400", async () => {
+  const r = await handleSubtitleFormat({ version: "v3", text: "" }, { OPENAI_API_KEY: "k" }, HEADERS, ALICE);
+  assert.equal(r.status, 400);
 });
