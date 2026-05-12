@@ -57,6 +57,27 @@ function prebuildDriftGuard() {
   console.log(`  ✅ config.js → ${CANONICAL_WORKER_URL}`);
 }
 
+// ★ pre-vite: index.html 을 dev entry 로 swap (사고 영구 fix)
+// 이전 build 가 production script src (`/lab/assets/index_build-*.js`) 를 박았을
+// 때 vite re-build 가 이를 input 으로 resolve 시도 → 실패. 사전 swap 으로 차단.
+function swapIndexToDevEntry() {
+  console.log("▶ index.html → dev entry swap");
+  if (!existsSync(INDEX_HTML)) return;
+  let html = readFileSync(INDEX_HTML, "utf-8");
+  // production: <script type="module" crossorigin src="/lab/assets/index_build-*.js"></script>
+  // dev:        <script type="module" src="/src/main.jsx"></script>
+  const re = /<script\s+type="module"(?:\s+crossorigin)?\s+src="\/lab\/assets\/index_build-[^"]+\.js"><\/script>/;
+  if (re.test(html)) {
+    html = html.replace(re, '<script type="module" src="/src/main.jsx"></script>');
+    writeFileSync(INDEX_HTML, html);
+    console.log("  ✅ production → dev entry");
+  } else if (html.includes('/src/main.jsx')) {
+    console.log("  ✅ 이미 dev entry — skip");
+  } else {
+    console.warn("  ⚠️ index.html 에 script 태그를 식별 못 함 — vite build 가 실패할 수 있음");
+  }
+}
+
 // 2. VITE BUILD
 function viteBuild() {
   console.log("▶ vite build");
@@ -131,6 +152,7 @@ function postbuildDriftGuard() {
 
 // MAIN
 prebuildDriftGuard();
+swapIndexToDevEntry();
 viteBuild();
 copyDistToDocs();
 stalePurge();
