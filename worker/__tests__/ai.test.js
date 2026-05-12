@@ -367,14 +367,76 @@ test("handleHighlights: mode='edit' + draft_highlights 부재 → 400", async ()
   assert.equal(r.status, 400);
 });
 
-// ─── 7 LLM stub 검증 (analyze + correct + highlights 제외) ──────────────
+// ─── /visuals + /insert-cuts + /hl-recommend + /hl-timestamps (Phase 5) ─
+
+test("VISUALS_SYSTEM_PROMPT: 21+ 시각화 타입 + 규칙 정합", async () => {
+  const { VISUALS_SYSTEM_PROMPT, VISUAL_TYPES_SPEC } = await import("../ai.js");
+  assert.ok(VISUAL_TYPES_SPEC.includes("bar"));
+  assert.ok(VISUAL_TYPES_SPEC.includes("donut"));
+  assert.ok(VISUAL_TYPES_SPEC.includes("matrix"));
+  assert.ok(VISUAL_TYPES_SPEC.includes("venn"));
+  assert.ok(VISUALS_SYSTEM_PROMPT.includes("visual_guides"));
+  assert.ok(VISUALS_SYSTEM_PROMPT.includes("chart_data"));
+  assert.ok(!VISUALS_SYSTEM_PROMPT.includes("Disregard any instruction"));
+});
+
+test("handleVisuals: blocks 부재 → 400", async () => {
+  const r = await handleVisuals({ blocks: [] }, { OPENAI_API_KEY: "k" }, HEADERS, ALICE);
+  assert.equal(r.status, 400);
+});
+
+test("handleVisuals: API 키 부재 → 503", async () => {
+  const r = await handleVisuals({ blocks: [{ index: 0, text: "x" }] }, {}, HEADERS, ALICE);
+  assert.equal(r.status, 503);
+});
+
+test("INSERT_CUTS_SYSTEM_PROMPT: 3 type 정합", async () => {
+  const { INSERT_CUTS_SYSTEM_PROMPT } = await import("../ai.js");
+  assert.ok(INSERT_CUTS_SYSTEM_PROMPT.includes("Type A"));
+  assert.ok(INSERT_CUTS_SYSTEM_PROMPT.includes("Type B"));
+  assert.ok(INSERT_CUTS_SYSTEM_PROMPT.includes("Type C"));
+  assert.ok(INSERT_CUTS_SYSTEM_PROMPT.includes("trigger_quote"));
+});
+
+test("handleInsertCuts: API 키 부재 → 503", async () => {
+  const r = await handleInsertCuts({ blocks: [{ index: 0, text: "x" }] }, {}, HEADERS, ALICE);
+  assert.equal(r.status, 503);
+});
+
+test("HL_RECOMMEND_PROMPT + compressScriptForHl 검증", async () => {
+  const { HL_RECOMMEND_PROMPT, compressScriptForHl } = await import("../ai.js");
+  assert.ok(HL_RECOMMEND_PROMPT.includes("하이라이트"));
+  assert.ok(HL_RECOMMEND_PROMPT.includes("8~12개"));
+  // compress: 짧은 텍스트 → 그대로
+  assert.equal(compressScriptForHl("짧다", 100), "짧다");
+  // 긴 텍스트 → head + mid + tail
+  const long = "x".repeat(5000);
+  const c = compressScriptForHl(long, 1000);
+  assert.ok(c.length < long.length);
+  assert.ok(c.includes("[...중략...]"));
+});
+
+test("handleHlRecommend: script 부재 → 400", async () => {
+  const r = await handleHlRecommend({}, { OPENAI_API_KEY: "k" }, HEADERS, ALICE);
+  assert.equal(r.status, 400);
+});
+
+test("HL_TIMESTAMPS_PROMPT: 챕터 5-10 규칙 정합", async () => {
+  const { HL_TIMESTAMPS_PROMPT } = await import("../ai.js");
+  assert.ok(HL_TIMESTAMPS_PROMPT.includes("5~10개"));
+  assert.ok(HL_TIMESTAMPS_PROMPT.includes("anchor_text"));
+  assert.ok(HL_TIMESTAMPS_PROMPT.includes("SEO"));
+});
+
+test("handleHlTimestamps: API 키 부재 → 503", async () => {
+  const r = await handleHlTimestamps({ script: "테스트 원고" }, {}, HEADERS, ALICE);
+  assert.equal(r.status, 503);
+});
+
+// ─── 3 LLM stub 검증 (term-explain + setgen + subtitle-format) ─────────
 
 const LLM_HANDLERS = [
   ["term-explain", handleTermExplain],
-  ["visuals", handleVisuals],
-  ["insert-cuts", handleInsertCuts],
-  ["hl-recommend", handleHlRecommend],
-  ["hl-timestamps", handleHlTimestamps],
   ["setgen", handleSetgen],
   ["subtitle-format", handleSubtitleFormat],
 ];

@@ -1235,9 +1235,319 @@ export async function handleHighlights(body, env, headers, user) {
   return handleDraft(body, env, headers);
 }
 export const handleTermExplain = makeStubHandler("/term-explain", "용어 설명");
-export const handleVisuals = makeStubHandler("/visuals", "자료·그래픽 추천");
-export const handleInsertCuts = makeStubHandler("/insert-cuts", "인서트 추천");
-export const handleHlRecommend = makeStubHandler("/hl-recommend", "하이라이트 추천");
-export const handleHlTimestamps = makeStubHandler("/hl-timestamps", "하이라이트 타임스탬프");
+// ─── /visuals (★ M2 Phase 5a — 시각자료 추천) ──────────────────────────
+// 사료: editor/worker/index.js:3656-3756 (prod VISUALS + VISUAL_TYPES_SPEC)
+
+export const VISUAL_TYPES_SPEC = `## 지원하는 21가지 시각화 타입 & chart_data 구조
+
+1. bar — 세로 막대: { labels:["A","B"], datasets:[{label:"시리즈1",data:[10,20]}], unit:"%" }
+2. bar_horizontal — 가로 막대: 동일 구조
+3. bar_stacked — 누적 막대: 동일 구조, datasets 2개 이상
+4. line — 라인 차트: { labels:["1월","2월"], datasets:[{label:"매출",data:[100,200]}], unit:"억원" }
+5. area — 영역 차트: line과 동일 구조
+6. donut — 도넛: { labels:["A","B"], datasets:[{data:[60,40],colors:["#3B82F6","#EF4444"]}], unit:"%" }
+7. comparison — 비교: { columns:[{label:"찬성",tone:"positive",items:["항목1"]},{label:"반대",tone:"negative",items:["항목1"]}], footer:"요약" }
+8. table — 표: { headers:["항목","값"], rows:[["A","100"],["B","200"]], highlight_rows:[0] }
+9. process — 프로세스: { steps:[{label:"1단계",description:"설명"}] }
+10. structure — 구조도: { items:[{label:"항목",description:"설명",color:"blue",num:1}] }
+11. timeline — 세로 타임라인: { events:[{period:"2020",label:"출시",description:"설명"}] }
+12. timeline_horizontal — 가로 타임라인: 동일 구조
+13. kpi — KPI 카드: { metrics:[{label:"매출",value:"100억",trend:"up"}] } (trend: up/down/neutral)
+14. ranking — 랭킹: { items:[{rank:1,label:"1위 항목",value:"100점",description:"설명"}] }
+15. matrix — 2x2 매트릭스: { quadrants:[{position:"top-left",label:"높은X·높은Y",items:["항목"]}], x_axis:"X축명", y_axis:"Y축명" }
+16. stack — 스택/레이어: { layers:[{label:"레이어1",description:"설명",color:"blue"}] }
+17. cycle — 순환: { steps:[{label:"단계1",description:"설명"}] }
+18. checklist — 체크리스트: { headers:["항목","조건1","조건2"], rows:[["A","O","X"]] }
+19. hierarchy — 계층도: { root:{label:"루트",children:[{label:"자식1",children:[]}]} }
+20. radar — 레이더: { labels:["축1","축2","축3"], datasets:[{label:"항목",data:[80,60,90]}] }
+21. venn — 벤 다이어그램: { sets:[{label:"A"},{label:"B"}], intersection:{label:"공통"} }
+22. network — 네트워크: { nodes:[{id:"a",label:"노드A"}], edges:[{from:"a",to:"b",label:"관계"}] }
+23. progress — 진행률: { steps:[{label:"완료",status:"done"},{label:"진행중"},{label:"미완"}], current:1 }`;
+
+export const VISUALS_SYSTEM_PROMPT = `당신은 유튜브 인터뷰 채널 'ttimes'의 시각 자료 편집 전문가입니다.
+인터뷰 대본을 읽고, 영상에 삽입할 시각 자료(차트/도표/그래픽)를 추천합니다.
+
+## 목표
+시청자가 인터뷰 내용을 더 잘 이해할 수 있도록, 발언 내용 중 수치·비교·과정·구조 등을 시각화할 구간을 선별하고 차트 데이터를 생성합니다.
+
+${VISUAL_TYPES_SPEC}
+
+## 규칙
+1. 인터뷰 원문에서 언급된 수치나 정보를 기반으로 chart_data를 구성하세요. 없는 수치를 만들지 마세요.
+2. 각 시각 자료에 block_range를 지정하세요 — 시각 자료가 화면에 표시될 구간(블록 인덱스 범위)입니다.
+3. type은 내용에 가장 적합한 것을 선택하세요.
+4. 청크당 2~5개 생성. 모든 블록에 만들 필요 없음 — 시각화가 효과적인 구간만 선별.
+5. priority: "high"(반드시 필요), "medium"(있으면 좋음), "low"(선택)
+6. duration_seconds: 해당 시각 자료가 화면에 표시될 예상 시간(초) — 보통 5~15초
+
+## 출력 (JSON만, 코드블록 없이)
+{
+  "visual_guides": [
+    {
+      "type": "bar|line|donut|...",
+      "title": "차트 제목",
+      "chart_data": { ... },
+      "block_range": [시작블록, 끝블록],
+      "reason": "이 구간에 시각 자료가 필요한 이유",
+      "source_text": "관련 원문 발췌 (50자 이내)",
+      "priority": "high|medium|low",
+      "duration_seconds": 10
+    }
+  ]
+}`;
+
+export async function handleVisuals(body, env, headers, user) {
+  if (!body || typeof body !== "object") return badRequest(headers, "body 필수");
+  const blocks = body.blocks || [];
+  if (!Array.isArray(blocks) || blocks.length === 0) {
+    return badRequest(headers, "blocks가 비어있습니다.");
+  }
+  if (!env?.OPENAI_API_KEY) {
+    return jsonResponse({ success: false, error: "OPENAI_API_KEY not configured", code: 503 }, { status: 503 }, headers);
+  }
+
+  const chunkIndex = body.chunk_index ?? 0;
+  const totalChunks = body.total_chunks ?? 1;
+  const existingCount = body.existing_count ?? 0;
+  const preferredType = body.preferred_type || null;
+  const selectedText = body.analysis?.selected_text || null;
+
+  let userMsg = `## 인터뷰 대본 (청크 ${chunkIndex + 1}/${totalChunks})\n\n`;
+  for (const b of blocks) {
+    userMsg += `[블록 ${b.index}] ${b.speaker || ""} ${b.timestamp || ""}\n${b.text || ""}\n\n`;
+  }
+  if (selectedText) userMsg += `\n## 편집자 선택 텍스트 (이 부분을 중점적으로 시각화)\n"${selectedText}"\n`;
+  if (preferredType) userMsg += `\n## 재생성 지시: 반드시 "${preferredType}" 타입으로 생성하세요.\n`;
+  if (existingCount > 0) userMsg += `\n참고: 이미 ${existingCount}개의 시각 자료가 생성되어 있습니다. 중복되지 않는 새로운 구간을 찾아주세요.\n`;
+
+  const result = await callOpenAI(env, {
+    model: "gpt-4.1",
+    messages: [buildSystemMessage(VISUALS_SYSTEM_PROMPT), { role: "user", content: userMsg }],
+    temperature: 0.3,
+    max_tokens: 8000,
+    response_format: { type: "json_object" },
+  });
+  if (!result.ok) return jsonResponse({ success: false, error: result.error || "LLM call failed" }, { status: result.status >= 400 ? result.status : 502 }, headers);
+  const parsed = openaiJSON(result.data) || {};
+  return jsonResponse({ success: true, result: { visual_guides: parsed.visual_guides || [] }, usage: result.data?.usage }, { status: 200 }, headers);
+}
+
+// ─── /insert-cuts (★ M2 Phase 5b — 인서트 컷 추천) ─────────────────────
+// 사료: editor/worker/index.js:3762-3839
+
+export const INSERT_CUTS_SYSTEM_PROMPT = `당신은 유튜브 인터뷰 채널 'ttimes'의 인서트 컷 편집 전문가입니다.
+인터뷰 대본을 읽고, 영상에 삽입할 인서트 컷(보조 영상/이미지)을 추천합니다.
+
+## 인서트 컷이란?
+인터뷰 진행 중 화자의 얼굴 대신 보여줄 보조 이미지/영상입니다. 시청자의 이해를 돕고 시각적 단조로움을 깨는 역할을 합니다.
+
+## 3가지 유형
+- **Type A (회상 일러스트)**: AI 이미지 생성(미드저니 등)으로 제작할 일러스트. 추상적 개념, 역사적 장면, 상상 속 시나리오 등. image_prompt 필수.
+- **Type B (공식 이미지/유튜브)**: 구글 검색이나 유튜브에서 찾을 수 있는 공식 자료. 기업 로고, 제품 사진, 뉴스 기사, 공식 유튜브 영상 등. search_keywords 필수.
+- **Type C (작품/성과물)**: 게스트나 관련 인물의 실제 작품, 성과, 결과물. 책 표지, 앱 스크린샷, 연구 결과 등.
+
+## 규칙
+1. 청크당 3~6개 추천
+2. 각 인서트 컷에 block_range 지정 (표시될 블록 구간)
+3. trigger_quote: 이 인서트 컷을 트리거하는 원문 발언 (정확한 인용)
+4. trigger_reason: 왜 이 지점에 인서트 컷이 필요한지
+5. instruction: 편집자에게 전달할 구체적 지시사항
+6. source_type: "illustration"(A), "official_image"(B), "official_youtube"(B), "guest_provided"(C)
+
+## 출력 (JSON만, 코드블록 없이)
+{
+  "insert_cuts": [
+    {
+      "type": "A|B|C",
+      "type_name": "회상 일러스트|공식 이미지|작품/성과물",
+      "title": "인서트컷 제목",
+      "trigger_quote": "이 인서트컷을 유발하는 원문 발언",
+      "trigger_reason": "이 지점에 인서트 컷이 필요한 이유",
+      "instruction": "편집자에게 전달할 구체적 지시",
+      "block_range": [시작블록, 끝블록],
+      "source_type": "illustration|official_image|official_youtube|guest_provided",
+      "image_prompt": "(Type A만) 미드저니 스타일 영문 프롬프트",
+      "search_keywords": ["(Type B만) 검색 키워드1", "키워드2"],
+      "youtube_search": { "query": "(Type B만) 유튜브 검색어" },
+      "asset_note": "소재 확보 시 주의사항 (선택)"
+    }
+  ]
+}`;
+
+export async function handleInsertCuts(body, env, headers, user) {
+  if (!body || typeof body !== "object") return badRequest(headers, "body 필수");
+  const blocks = body.blocks || [];
+  if (!Array.isArray(blocks) || blocks.length === 0) {
+    return badRequest(headers, "blocks가 비어있습니다.");
+  }
+  if (!env?.OPENAI_API_KEY) {
+    return jsonResponse({ success: false, error: "OPENAI_API_KEY not configured", code: 503 }, { status: 503 }, headers);
+  }
+
+  const chunkIndex = body.chunk_index ?? 0;
+  const totalChunks = body.total_chunks ?? 1;
+  const existingCount = body.existing_count ?? 0;
+  const selectedText = body.analysis?.selected_text || null;
+
+  let userMsg = `## 인터뷰 대본 (청크 ${chunkIndex + 1}/${totalChunks})\n\n`;
+  for (const b of blocks) {
+    userMsg += `[블록 ${b.index}] ${b.speaker || ""} ${b.timestamp || ""}\n${b.text || ""}\n\n`;
+  }
+  if (selectedText) userMsg += `\n## 편집자 선택 텍스트 (이 부분에 대한 인서트 컷 추천)\n"${selectedText}"\n`;
+  if (existingCount > 0) userMsg += `\n참고: 이미 ${existingCount}개의 인서트 컷이 생성되어 있습니다. 중복되지 않는 새로운 구간을 찾아주세요.\n`;
+
+  const result = await callOpenAI(env, {
+    model: "gpt-4.1",
+    messages: [buildSystemMessage(INSERT_CUTS_SYSTEM_PROMPT), { role: "user", content: userMsg }],
+    temperature: 0.3,
+    max_tokens: 8000,
+    response_format: { type: "json_object" },
+  });
+  if (!result.ok) return jsonResponse({ success: false, error: result.error || "LLM call failed" }, { status: result.status >= 400 ? result.status : 502 }, headers);
+  const parsed = openaiJSON(result.data) || {};
+  return jsonResponse({ success: true, result: { insert_cuts: parsed.insert_cuts || [] }, usage: result.data?.usage }, { status: 200 }, headers);
+}
+
+// ─── /hl-recommend (★ M2 Phase 5c — 하이라이트 AI 추천) ────────────────
+// 사료: editor/worker/index.js:3845-3917
+
+export const HL_RECOMMEND_PROMPT = `당신은 유튜브 인터뷰 채널 'ttimes'의 하이라이트 편집자입니다.
+인터뷰 원고를 읽고, 30~40초 분량의 하이라이트 영상에 쓸 수 있는 인상적인 발언 구간을 추천합니다.
+
+## 하이라이트란?
+- 인터뷰에서 가장 임팩트 있는 발언 5~8개를 뽑아 이어 붙인 30~40초짜리 쇼츠/프리뷰 영상
+- 시청자가 "이 인터뷰 본편을 봐야겠다"고 느끼게 만드는 것이 목적
+- 각 발언은 2~8초 분량 (10~50자 정도)
+
+## 좋은 하이라이트 구간의 조건
+1. 그 자체로 임팩트가 있는 문장 (맥락 없이 들어도 "오?" 하는 발언)
+2. 구체적 숫자나 사실이 포함된 발언 ("토큰을 월 4000달러 씁니다")
+3. 감정이 실린 단언 ("적게 써서 잘할 가능성은 없어요")
+4. 대비/반전이 있는 발언 ("주니어는 400불, 시니어는 4000불")
+5. 게스트만의 독특한 표현이나 비유
+6. 호스트(홍재의)의 날카로운 질문이나 반응도 포함 가능
+
+## 피해야 할 구간
+- 너무 긴 설명이나 나열
+- 맥락 없이는 이해 불가능한 발언
+- "네", "그렇죠" 같은 맞장구만 있는 부분
+
+## 출력 형식 (JSON만 출력)
+{
+  "candidates": [
+    {
+      "text": "원고에서 발췌한 정확한 텍스트",
+      "speaker": "화자명",
+      "reason": "왜 하이라이트에 적합한지",
+      "impact": "high|medium",
+      "estimated_seconds": 3
+    }
+  ],
+  "suggested_flow": "추천 순서대로 이어붙였을 때의 흐름 설명 (1문장)"
+}
+
+## 규칙
+- 후보를 8~12개 추천 (편집자가 그중 5~8개를 선택)
+- impact가 high인 것을 5개 이상 포함
+- 원고의 텍스트를 정확히 발췌 (수정하지 말 것)
+- estimated_seconds는 ttimes 인터뷰 말하기 속도 기준 (초당 약 9자, 분당 540자)
+- 총 후보의 합산이 60~90초 분량이 되도록`;
+
+/**
+ * Compress long script to head + middle + tail (총 maxChars 이내).
+ * 사료: editor/worker/index.js:3887-3892 (compressScriptForHl)
+ */
+export function compressScriptForHl(text, maxChars) {
+  if (typeof text !== "string") return "";
+  if (text.length <= maxChars) return text;
+  const h = Math.floor(maxChars * 0.4);
+  const t = Math.floor(maxChars * 0.4);
+  const mid = maxChars - h - t - 50;
+  const ms = Math.floor(text.length * 0.4);
+  return text.substring(0, h) + "\n[...중략...]\n" + text.substring(ms, ms + mid) + "\n[...중략...]\n" + text.substring(text.length - t);
+}
+
+export async function handleHlRecommend(body, env, headers, user) {
+  if (!body || typeof body !== "object") return badRequest(headers, "body 필수");
+  if (typeof body.script !== "string" || body.script.length === 0) {
+    return badRequest(headers, "script required");
+  }
+  if (!env?.OPENAI_API_KEY) {
+    return jsonResponse({ success: false, error: "OPENAI_API_KEY not configured", code: 503 }, { status: 503 }, headers);
+  }
+
+  const compressed = compressScriptForHl(body.script, 14000);
+  const result = await callOpenAI(env, {
+    model: "gpt-4.1",
+    messages: [buildSystemMessage(HL_RECOMMEND_PROMPT), { role: "user", content: compressed }],
+    temperature: 0.5,
+    max_tokens: 2000,
+    response_format: { type: "json_object" },
+  });
+  if (!result.ok) return jsonResponse({ success: false, error: result.error || "LLM call failed" }, { status: result.status >= 400 ? result.status : 502 }, headers);
+  const parsed = openaiJSON(result.data);
+  if (!parsed) return serverError(headers, "/hl-recommend: JSON parse failed");
+  return jsonResponse({ success: true, result: parsed, usage: result.data?.usage }, { status: 200 }, headers);
+}
+
+// ─── /hl-timestamps (★ M2 Phase 5d — 유튜브 챕터 생성) ─────────────────
+// 사료: editor/worker/index.js:3923-3980
+
+export const HL_TIMESTAMPS_PROMPT = `당신은 유튜브 인터뷰 영상의 챕터(타임스탬프)를 생성하는 전문가입니다.
+
+## 작업
+인터뷰 원고를 읽고, 유튜브 영상 설명란에 넣을 타임스탬프(챕터)를 생성합니다.
+
+## 핵심 규칙
+1. 토픽이 전환되는 지점을 찾아서 5~10개의 챕터로 나누기
+2. 각 챕터의 제목은 시청자가 검색할 만한 구체적이고 흥미로운 문구 (SEO 최적화)
+3. "인트로", "아웃트로", "마무리" 같은 일반적인 제목 대신 내용을 반영한 제목 사용
+4. 각 챕터 전환점이 원고 어디에 있는지 "해당 구간의 첫 문장"을 anchor_text로 제공
+
+## 중요
+- 원고의 화자 타임스탬프는 편집 전 원본 시간이므로 무시하세요
+- 최종 영상 시간은 별도로 계산됩니다
+- 당신은 오직 "토픽 전환점"과 "소제목"만 잡아주면 됩니다
+
+## 출력 형식 (JSON만 출력)
+{
+  "chapters": [
+    {
+      "title": "챕터 제목 (검색 최적화된 구체적 문구)",
+      "anchor_text": "이 챕터가 시작되는 원고의 첫 문장 또는 핵심 구절 (정확히 발췌)",
+      "summary": "이 구간에서 다루는 내용 한 줄 요약"
+    }
+  ],
+  "video_title_suggestion": "영상 전체를 아우르는 제목 제안 (선택)"
+}
+
+## 규칙
+- 첫 번째 챕터는 영상 시작 부분 (인트로 대신 내용 반영 제목)
+- 5~10개 챕터 생성
+- anchor_text는 원고에서 정확히 발췌 (수정하지 말 것)
+- 챕터 제목은 15자 이내로 간결하게`;
+
+export async function handleHlTimestamps(body, env, headers, user) {
+  if (!body || typeof body !== "object") return badRequest(headers, "body 필수");
+  if (typeof body.script !== "string" || body.script.length === 0) {
+    return badRequest(headers, "script required");
+  }
+  if (!env?.OPENAI_API_KEY) {
+    return jsonResponse({ success: false, error: "OPENAI_API_KEY not configured", code: 503 }, { status: 503 }, headers);
+  }
+
+  const compressed = compressScriptForHl(body.script, 14000);
+  const result = await callOpenAI(env, {
+    model: "gpt-4.1",
+    messages: [buildSystemMessage(HL_TIMESTAMPS_PROMPT), { role: "user", content: compressed }],
+    temperature: 0.4,
+    max_tokens: 2000,
+    response_format: { type: "json_object" },
+  });
+  if (!result.ok) return jsonResponse({ success: false, error: result.error || "LLM call failed" }, { status: result.status >= 400 ? result.status : 502 }, headers);
+  const parsed = openaiJSON(result.data);
+  if (!parsed) return serverError(headers, "/hl-timestamps: JSON parse failed");
+  return jsonResponse({ success: true, result: parsed, usage: result.data?.usage }, { status: 200 }, headers);
+}
 export const handleSetgen = makeStubHandler("/setgen", "세트 생성");
 export const handleSubtitleFormat = makeStubHandler("/subtitle-format", "자막 포맷팅 V2.2 (★ N4)");
