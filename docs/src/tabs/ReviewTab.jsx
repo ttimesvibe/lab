@@ -155,7 +155,7 @@ export function ReviewTab({ tabId, data, onSave, onMultiSave, sessionId, config,
               boxShadow: analyzing ? "none" : "0 2px 8px rgba(74,108,247,0.3)",
             }}
           >
-            {analyzeResult ? "재분석" : (hasTrackChanges ? "삭제선 제거 → 분석 시작" : "분석 시작 (1차 교정 준비)")}
+            {analyzeResult ? "사전 분석 재실행" : (hasTrackChanges ? "삭제선 제거 → 사전 분석 시작" : "사전 분석 시작")}
           </button>
         </div>
         {analyzeError && (
