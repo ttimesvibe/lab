@@ -9,7 +9,7 @@
 import { useState } from "react";
 import { apiAnalyze } from "../utils/api.js";
 import { calcRegression, calcDuration, secondsToDisplay } from "../utils/lengthModel.js";
-import { stripStrikeFromBlocks } from "../utils/parseBlocks.js";
+import { parseBlocks } from "../utils/parseBlocks.js";
 
 export function ReviewTab({ tabId, data, onSave, onMultiSave, sessionId, config, currentTab, authUser }) {
   const reviewBlocks = data?.reviewBlocks || [];
@@ -71,11 +71,13 @@ export function ReviewTab({ tabId, data, onSave, onMultiSave, sessionId, config,
 
       // ★ review._analysisSummary 박제 → 탭 이동/리로드 후에도 시각 표시 보존
       // ★ correction.anal + blocks 박제 → 다음 단계 /correct 가 사용
-      //   1) 80%+ 삭제 블록 제외 (delSet)
-      //   2) 각 블록 내 strike segment 도 제거 (stripStrikeFromBlocks)
-      //   → LLM 입력에서 삭제선 영역 완전 배제 (사용자 보고 fix)
-      const keptBlocks = reviewBlocks.filter((b) => !delSet.has(b.index));
-      const cleanedBlocks = stripStrikeFromBlocks(keptBlocks, data?.blockStrikeRanges);
+      //   삭제선 영역 완전 배제 방식: cleanText 에서 parseBlocks 재실행 → 빈 블록 제외
+      //   (stripStrikeFromBlocks 보다 견고 — blockStrikeRanges 누락/오류 무관)
+      const cleanReviewBlocks = parseBlocks(cleanText);
+      // ★ 0차 검토 화면의 reviewBlocks 와 인덱스 정합 (block.index 가 reviewBlocks 의 위치를 가리키도록)
+      //   cleanText 에서 만든 블록은 새로운 0-based index 를 부여받음. /correct 의 결과 chunk.block_index
+      //   가 이 새 index 와 일치하므로 CorrectionTab 의 diff 시각화도 정합.
+      const cleanedBlocks = cleanReviewBlocks.filter((b) => b.text && b.text.trim().length > 0);
 
       if (typeof onMultiSave === "function") {
         onMultiSave({
