@@ -91,3 +91,43 @@ export function calcDuration(blocks, deletedBlockIndices = new Set()) {
   }
   return { totalSeconds, deletedSeconds, keptSeconds, totalChars, deletedChars, keptChars };
 }
+
+// ─── /correct 청크 분할 (★ 사료 lengthModel.js:133-153) ──────────────────
+
+/**
+ * Split blocks into chunks of <= max chars, with 2-block context overlap.
+ *   - 각 청크의 마지막 2 블록이 다음 청크의 isContext: true 로 prepend
+ *   - LLM 이 청크 경계 문맥을 인지하도록 (1차 교정 일관성)
+ */
+export function splitChunks(blocks, max = 15000) {
+  const ch = [];
+  let c = [], l = 0;
+  for (const b of blocks) {
+    if (l + (b.text?.length || 0) > max && c.length > 0) {
+      ch.push(c);
+      const ov = c.slice(-2).map((x) => ({ ...x, isContext: true }));
+      c = [...ov];
+      l = ov.reduce((s, x) => s + (x.text?.length || 0), 0);
+    }
+    c.push(b);
+    l += (b.text?.length || 0);
+  }
+  if (c.length > 0) ch.push(c);
+  return ch;
+}
+
+/** 청크 → /correct 의 chunk_text (isContext=false 만, 블록 라벨 + 화자 + 타임스탬프 포함). */
+export function chunkToText(chunk) {
+  return chunk
+    .filter((b) => !b.isContext)
+    .map((b) => `[블록 ${b.index}] ${b.speaker} ${b.timestamp}\n${b.text}`)
+    .join("\n\n");
+}
+
+/** 청크 → /correct 의 context_blocks (isContext=true 만, 옵션). */
+export function chunkCtx(chunk) {
+  const ctx = chunk.filter((b) => b.isContext);
+  return ctx.length
+    ? ctx.map((b) => `${b.speaker} ${b.timestamp}\n${b.text}`).join("\n\n")
+    : undefined;
+}
