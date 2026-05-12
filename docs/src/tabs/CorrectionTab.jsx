@@ -50,8 +50,10 @@ export function CorrectionTab({ tabId, data, onSave, onMultiSave, sessionId, con
     setError("");
 
     try {
+      // ★ 빈 텍스트 블록 제외 (strike 전체였던 블록은 .index 보존을 위해 빈 텍스트로 박혀있음)
+      const blocksForLLM = blocks.filter((b) => b.text && b.text.trim().length > 0);
       // ★ splitChunks: 15K 자 청크 + 2 블록 context overlap
-      const chunks = splitChunks(blocks, 15000);
+      const chunks = splitChunks(blocksForLLM, 15000);
       setProgress({ done: 0, total: chunks.length });
 
       const allDiffs = [];
