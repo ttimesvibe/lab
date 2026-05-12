@@ -911,7 +911,7 @@ export async function handleCorrect(body, env, headers, user) {
         { role: "user", content: userMsg },
       ],
       temperature: 0,
-      max_tokens: 32000,
+      max_tokens: 16000,  // ★ gpt-4o-mini 한계 16384 — prod 의 32000 (다른 모델) 부적용
       response_format: { type: "json_object" },
     });
 
