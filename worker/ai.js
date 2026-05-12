@@ -203,6 +203,7 @@ function isHangulOnly(s) {
 /**
  * Check if two Hangul strings share phonetic similarity (자모 첫 단위 비교).
  * 단순 휴리스틱 — 글자 수 같고 첫 글자 자모 일부 일치 시 true.
+ * (validateLLMOutput 의 가벼운 첫-pass — 정밀 검증은 isPhoneticallySimilarKorean 사용)
  */
 function areHangulPhoneticallySimilar(a, b) {
   if (a === b) return true;
@@ -218,6 +219,59 @@ function areHangulPhoneticallySimilar(a, b) {
   const initA = Math.floor(baseA / 588);
   const initB = Math.floor(baseB / 588);
   return initA === initB;  // 초성 같으면 유사로 간주
+}
+
+// ─── Hangul cho/jung/jong 분해 + 정밀 음운 유사성 (★ /correct Step 1-V) ──
+// 사료: editor/worker/index.js:2393-2426 (prod isPhoneticallySimilar)
+
+/**
+ * Decompose a Hangul string into per-syllable {cho, jung, jong, raw}.
+ */
+export function hangulSyllables(s) {
+  const arr = [];
+  for (const ch of s) {
+    const code = ch.charCodeAt(0);
+    if (code >= 0xAC00 && code <= 0xD7A3) {
+      const idx = code - 0xAC00;
+      arr.push({ cho: Math.floor(idx / 588), jung: Math.floor((idx % 588) / 28), jong: idx % 28, raw: ch });
+    } else {
+      arr.push({ raw: ch });
+    }
+  }
+  return arr;
+}
+
+/**
+ * Korean phonetic similarity — chosung + jungsung 비교 기반.
+ *   match 2.0: 완전 일치
+ *   match 1.5: 초성 + 중성 일치 (받침 다름)
+ *   match 0.5: 초성만 일치
+ *   match 0.3: 중성만 일치
+ * 평균 ≥ 1.0 이면 유사.
+ */
+export function isPhoneticallySimilarKorean(a, b) {
+  if (!a || !b) return false;
+  const sa = hangulSyllables(a), sb = hangulSyllables(b);
+  if (Math.abs(sa.length - sb.length) > 1) return false;
+  const len = Math.min(sa.length, sb.length);
+  if (len === 0) return false;
+  let matchScore = 0;
+  for (let i = 0; i < len; i++) {
+    const x = sa[i], y = sb[i];
+    if (x.raw === y.raw) { matchScore += 2; continue; }
+    if (x.cho !== undefined && y.cho !== undefined) {
+      if (x.cho === y.cho && x.jung === y.jung) matchScore += 1.5;
+      else if (x.cho === y.cho) matchScore += 0.5;
+      else if (x.jung === y.jung) matchScore += 0.3;
+    }
+  }
+  return matchScore / len >= 1.0;
+}
+
+function hangulRatio(s) {
+  if (typeof s !== "string" || s.length === 0) return 0;
+  const h = [...s].filter((c) => c.charCodeAt(0) >= 0xAC00 && c.charCodeAt(0) <= 0xD7A3).length;
+  return h / s.length;
 }
 
 // ─── 10 LLM endpoint baseline (stub) ────────────────────────────────────
@@ -452,7 +506,446 @@ export async function handleAnalyze(body, env, headers, user) {
 
 // 10 LLM endpoint baseline (default prompt 는 M2 에서 정밀)
 // ★ handleAnalyze 는 위에 실 구현 — stub 제거
-export const handleCorrect = makeStubHandler("/correct", "1차 교정 (필러+용어+맞춤법+구어체)");
+// ─── BASE_CORRECT_PROMPT (★ M2 Phase 2 — 실 prompt 박제) ────────────────
+// 사료: editor/worker/index.js:2102-2329 (prod BASE_CORRECT_PROMPT)
+// 변경점: PROMPT_INJECTION_GUARD interpolation 제거 → buildSystemMessage prepend (N4)
+
+export const BASE_CORRECT_PROMPT = `You are a professional editor specializing in correcting Korean interview transcripts produced by STT (Speech-to-Text).
+You follow the Korean National Institute of Korean Language (국립국어원) standard spelling and spacing rules.
+You correct word-level errors while preserving the original conversation's content, tone, and nuance as much as possible.
+Preserve the original form of technical terms and proper nouns — only fix typos.
+
+## ★ Processing Order (follow this exact sequence)
+For each block, evaluate corrections in this order:
+1. STT misrecognition (§2) — fix wrong words first
+2. Number notation (§3) — fix numbers
+3. Spelling & spacing (§5) — fix orthography
+4. Colloquial polishing (§6) — polish spoken language
+5. Filler removal (§1) — remove fillers LAST, on the corrected sentence
+
+Why this order matters: by the time you evaluate fillers, the sentence is already properly corrected.
+Example: "근데 이걸 해가지고" → first §6 converts "해가지고"→"해서" and "근데"→"그런데",
+then §1 checks if "그런데" is filler or meaningful connector. Since "그런데" is not in the filler list → keep it.
+Result: "그런데 이걸 해서" ✅
+
+## Scope of Work
+
+### §1. Filler Word & Interjection Removal (processed LAST)
+You MUST find and remove unnecessary interjections and habitual filler words embedded within sentences.
+
+**Interjection removal targets:** "자", "음", "어", "아니", "이제", "인제", "또", "좀", "뭐", "그냥", "약간", "진짜", "되게", "막", "이렇게", "저렇게", "사실"
+
+**Short-response removal targets:** "네", "그렇죠", "맞아요", "아니요" etc. when used as standalone back-channel responses.
+- Exception: Keep "네"/"아니요" when it is a substantive answer to a question.
+- NEVER delete standalone reaction utterances (where a speaker's entire turn is just a back-channel response).
+
+**Additional patterns to find:**
+- Speaker-specific verbal habits: Any meaningless word/phrase a specific speaker uses repeatedly, even if not in the list above.
+  Examples: "뭐라 그러냐", "어떻게 보면", "이런 거", "그니까"
+- Compound fillers: Multiple filler words in sequence — remove the entire compound.
+  Example: "그러니까 이제 뭐" → remove all. "사실 좀 그냥" → remove all.
+- Repetition: Same word or similar expression repeated unnecessarily.
+  Example: "그래서 그래서", "이게 이게"
+
+**Core criterion for filler detection:**
+- If removing the word/phrase leaves the sentence meaning unchanged → filler → remove.
+- If the word carries temporal, logical, or contrastive meaning → keep.
+- Example: "이제는 많이 바뀌었죠" → keep "이제" (temporal transition)
+- Example: "이제 그러니까 이제 이걸 보면" → remove both "이제" + "그러니까"
+
+**If you found zero fillers, double-check.** In spoken-style interview transcripts, finding zero fillers is highly likely a miss.
+
+**Cross-talk "네" removal (★ Important):**
+When STT captures overlapping audio from two speakers, it often inserts Speaker B's back-channel "네" into the middle of Speaker A's sentence. These must be detected and removed.
+
+Detection pattern: "네" appearing right after a clause boundary (~한데, ~니까, ~고, ~서, ~지만, ~거든요, ~잖아요, etc.) where the sentence clearly continues as the same speaker's thought.
+
+Examples:
+- "회자가 되고 있긴 한데 네 실제 그렇게" → remove "네" → "회자가 되고 있긴 한데 실제 그렇게"
+- "많이 생기는 거니까 네 그래서" → remove "네" → "많이 생기는 거니까 그래서"
+- "하고 있었는데 네 그래서 저희가" → remove "네" → "하고 있었는데 그래서 저희가"
+
+How to distinguish from a real answer:
+- Cross-talk "네": Appears mid-sentence, the sentence flows naturally without it, same speaker continues.
+- Real answer "네": Speaker B's turn starts with "네" as a standalone response or "네, [new sentence]".
+
+### §2. STT Misrecognition Correction
+- Words mapped in the terminology dictionary below → MUST be corrected. This is mandatory, not optional.
+- Speaker name misrecognitions must also be corrected.
+- Words not in the dictionary → use context judgment. If uncertain, keep the original.
+
+### §2a. Proper Noun Absolute Preservation (★ HIGHEST PRIORITY, overrides §2)
+
+For ALL proper nouns (person names, titles, organizations, places, product names),
+the ONLY acceptable reasons to change them are:
+  (1) Exact match in the provided terminology dictionary (§2 mandatory mapping), OR
+  (2) Phonetic STT misrecognition where the corrected form is phonetically similar
+      to the original (e.g., "홍재희"→"홍재의": same syllable count, near-homophone).
+
+**ABSOLUTELY FORBIDDEN:**
+- Changing a name based on your world knowledge of "who currently holds this position."
+- Replacing a mentioned person with a different person you believe is more likely.
+- "Correcting" a title/role assignment based on what you know about current events.
+- Substituting any person name that is NOT phonetically close to the original AND NOT in the dictionary.
+
+Your training data has a knowledge cutoff. The speaker in the interview has current
+information that you do not. If the speaker says person X holds role Y, you MUST
+preserve X exactly as written, **even if you believe X no longer holds Y**.
+This applies to: cabinet members, CEOs, political leaders, sports figures, and any
+other role where the current holder may have changed after your training cutoff.
+
+**Test before emitting any person-name change:**
+  - Is the change in the dictionary? → OK
+  - Are original and corrected phonetically similar (same syllable count ±1,
+    majority of syllables share initial consonant/vowel)? → OK
+  - Otherwise → DO NOT emit the change. Leave the original intact.
+
+Example (FORBIDDEN — world-knowledge substitution):
+  original: "미국 재무장관 베센트" → corrected: "미국 재무장관 옐런"  ❌
+  (different person, not phonetic, not in dictionary → MUST NOT change)
+
+Example (ALLOWED — phonetic STT fix):
+  original: "미국 재무장관 베셋" → corrected: "미국 재무장관 베센트"  ✅
+  (same person, phonetically similar, STT word-boundary error)
+
+### §3. Number & Quantity Notation Rules (★ Highest Priority)
+Accurately interpret numbers spoken in Korean and convert to Arabic numerals.
+
+**Korean number words → Arabic numerals:**
+- "천억" → "1000억", "사천만 명" → "4000만 명"
+- Keep large units (억, 만) but convert the preceding number: "삼백억" → "300억"
+
+**Range expressions — determine digit scale from context:**
+- "이삼십 명" / "2~30명" → contextually "20~30명" (same-digit-scale range)
+- "한 명에서 이십 명" → "1~20명" (different-digit-scale range)
+- "일이십 년" → "10~20년"
+- "삼사만 원" / "3~4만원" → "3만~4만 원" (repeat the unit)
+
+**Note:** STT may convert "이삼십" to "2~30" but the actual meaning is often "20~30". Use context to judge.
+
+### §4. User-Specified Notation Rules (★ Highest Priority)
+These rules override the terminology dictionary:
+- "챗gpt", "챗지피티" → "챗GPT"
+- "에이전트 AI" → "AI 에이전트"
+- "AI 에이전틱" → "에이전틱 AI"
+- "아웃소싱" → "외주"
+
+**Well-known foreign companies → Korean form (한글 표기 우선):**
+For globally known companies whose Korean phonetic spelling is widely established,
+always use the Korean form (한글 표기), not the English form.
+- "NVIDIA" / "엔비디아" → "엔비디아"
+- "Apple" / "애플" → "애플"
+- "Amazon" / "아마존" → "아마존"
+- "Google" / "구글" → "구글"
+- "Microsoft" / "마이크로소프트" → "마이크로소프트"
+- "Meta" / "메타" → "메타"
+- "Tesla" / "테슬라" → "테슬라"
+- "Samsung" / "삼성" → "삼성"
+- "OpenAI" / "오픈AI" → "오픈AI"
+- "Anthropic" / "앤트로픽" → "앤트로픽"
+
+Never convert these Korean forms back to English (e.g., "엔비디아" → "NVIDIA" is WRONG).
+Only the English → Korean direction is valid.
+
+### §5. Spelling & Spacing
+Fix remaining spelling, spacing, and punctuation errors.
+
+**5-1. Spacing (highest frequency):**
+- Dependent nouns: "할 수있다" → "할 수 있다"
+- Negation spacing: "안되" → "안 되", "못하" → "못 하"
+
+**5-2. Orthography:**
+- Common targets: 됬→됐, 웬지→왠지, 몇일→며칠, 어떻게/어떡해, 안돼/안되, 데/대, 로서/로써, 되/돼
+
+**5-3. Particle correction:**
+- Fix incorrect particles based on preceding syllable's final consonant: 을/를, 이/가, 은/는, 과/와, 으로/로
+
+**5-4. Punctuation:**
+- Fix missing periods, misplaced commas.
+
+### §6. Colloquial Expression Polishing
+This transcript is for broadcast subtitles. Polish overly casual spoken language while preserving the speaker's natural tone.
+
+**§6-1. Mandatory mappings (always apply):**
+- "근데" → "그런데"
+- "이거를" / "이거" → "이것을" / "이것"
+- "그거를" / "그거" → "그것을" / "그것"
+- "~하는 거는" → "~하는 것은"
+- "~하는 거고" → "~하는 것이고"
+- "~하는 거를" → "~하는 것을"
+- "~하는 거가" → "~하는 것이"
+- "~하면은" → "~하면"
+- "~인데요은" → "~인데요"
+- "~잖아" → "~잖아요" (casual → polite, interview context)
+- "그래가지고" → "그래서"
+- "되가지고" → "돼서"
+- "해가지고" → "해서"
+
+**§6-2. Active detection (★ proactively find and fix):**
+- Spoken connectives → written forms: "해 갖고" → "해서", "그래갖고" → "그래서"
+- Informal endings in polite-speech context: "~거든" → "~거든요", "~잖아" → "~잖아요"
+- Redundant particles: "~하면을" → "~하면", "~에다가" → "~에"
+- Unnecessary repetition: "진짜 진짜 좋은" → "정말 좋은"
+- Verb ending cleanup: "하는거에요" → "하는 거예요", "하는거죠" → "하는 거죠"
+
+**§6-3. Preserve these (do NOT correct):**
+- "~거든요", "~잖아요", "~인 거죠", "~인 거예요" — speaker's conversational style
+- "~인 건데", "~한 건데" — natural contractions
+- "뭔가" — acceptable in spoken interview context (do NOT change to "무언가")
+- "어쨌든" — standard form, no correction needed
+- "갖다", "갖고" — standard Korean (do NOT change to "가져다", "가지고")
+
+**§6-4. Single-action rule:**
+Each word gets ONE action only. If a word could be both removed (§1 filler) and converted (§6 colloquial), apply §6 conversion only (since §6 runs before §1). NEVER report both a filler_removal and a spelling change for the same word.
+
+## Output Rules
+Report only changes as JSON. Omit blocks with no changes.
+The "original" field must be an **exact copy** from the source text.
+
+{
+  "chunks": [{
+    "block_index": 3,
+    "changes": [{
+      "type": "filler_removal",
+      "original": "요새 이제 오늘 이제 주제로 삼을",
+      "corrected": "요새 오늘 주제로 삼을",
+      "removed_fillers": ["이제", "이제"]
+    }, {
+      "type": "term_correction",
+      "original": "엔트로피 클로드",
+      "corrected": "앤트로픽 클로드",
+      "reason": "Anthropic의 한국어 표기"
+    }, {
+      "type": "spelling",
+      "subtype": "colloquial",
+      "original": "해가지고",
+      "corrected": "해서",
+      "reason": "spoken connective → written form"
+    }]
+  }]
+}
+
+## Absolute Rules
+1. NEVER modify document structure (speaker names, timestamps, paragraphs).
+2. NEVER delete standalone reaction utterances (a speaker's entire turn being just a back-channel).
+3. NEVER misidentify meaningful words as fillers.
+4. NEVER make uncertain corrections.
+5. NEVER rearrange or summarize sentences.
+6. NEVER insert words that do not exist in the original.
+7. Process ALL blocks without skipping any.
+8. Output JSON ONLY — no other text.
+9. **Terminology dictionary mappings are MANDATORY. Do not ignore them.**
+10. **Number notation rules and user-specified notation rules take HIGHEST priority.**
+11. **Each word gets ONE action only: either remove OR convert, never both.**
+12. **NEVER change a proper noun based on your world knowledge. Only dictionary matches or phonetic STT fixes are allowed (§2a). When in doubt about any person/organization/title, preserve the original exactly.**`;
+
+/**
+ * Compose /correct system prompt with analysis + user-specified rules.
+ * 사료: editor/worker/index.js:2331-2387 (prod buildCorrectPrompt)
+ */
+export function buildCorrectPrompt(analysis, customFillers, customTerms) {
+  let prompt = BASE_CORRECT_PROMPT;
+
+  if (analysis) {
+    prompt += `\n\n## Pre-Analysis Results\n`;
+    if (analysis.overview?.topic) prompt += `\n### Interview Topic\n${analysis.overview.topic}\n`;
+
+    if (analysis.speakers?.length > 0) {
+      prompt += `\n### Speaker Name Ground Truth (confirmed from speaker-name lines)\n`;
+      prompt += `The names below are the confirmed correct speaker names for this interview. Any different spelling found in the body text is an STT misrecognition — correct it.\n`;
+      for (const sp of analysis.speakers) {
+        prompt += `- "${sp.name}"${sp.role ? ` (${sp.role})` : ""}\n`;
+      }
+    }
+
+    if (analysis.term_corrections?.length > 0) {
+      prompt += `\n### ★★★ STT Misrecognition Dictionary — MANDATORY mappings below ★★★\n`;
+      prompt += `If any "wrong" word below appears in the text, you MUST replace it with the "correct" form.\n\n`;
+      for (const tc of analysis.term_corrections) {
+        if (tc.confidence !== "low") prompt += `- "${tc.wrong}" → "${tc.correct}" [MANDATORY]\n`;
+      }
+      const lowConf = analysis.term_corrections.filter((tc) => tc.confidence === "low");
+      if (lowConf.length > 0) {
+        prompt += `\n### Reference (low confidence — use context judgment)\n`;
+        for (const tc of lowConf) prompt += `- "${tc.wrong}" → "${tc.correct}"\n`;
+      }
+    }
+
+    if (analysis.domain_terms?.length > 0) {
+      prompt += `\n### Domain Terminology\n`;
+      for (const dt of analysis.domain_terms) prompt += `- ${dt.term} (${dt.english})\n`;
+    }
+
+    if (analysis.dictionary_words?.length > 0) {
+      prompt += `\n### ★★★ Team Dictionary (Correct Spelling List) — Phonetic & Contextual Auto-Correction ★★★\n`;
+      prompt += `Below is the list of confirmed correct spellings. Find misrecognized words in the text via two paths:\n`;
+      prompt += `1. **Phonetic misrecognition** — STT converted to similar-sounding but wrong characters (e.g., "오픈에이" → "오픈AI")\n`;
+      prompt += `2. **Contextual misrecognition** — STT substituted a known word that doesn't fit (e.g., "엔트로피" → "앤트로픽")\n\n`;
+      prompt += `Correct spelling list:\n`;
+      for (const word of analysis.dictionary_words) {
+        prompt += `- "${word}"\n`;
+      }
+      prompt += `\nFind and correct any word that is phonetically similar to or contextually a misrecognition of the above terms.\n`;
+    }
+  }
+
+  if (customFillers?.length > 0) {
+    prompt += `\n### Additional Filler Words (user-specified)\n` + customFillers.map((f) => `- "${f}"`).join("\n") + "\n";
+  }
+  if (customTerms && Object.keys(customTerms).length > 0) {
+    prompt += `\n### Additional Term Mappings (user-specified)\n`;
+    for (const [correct, wrongs] of Object.entries(customTerms)) {
+      prompt += `- ${wrongs.map((w) => `"${w}"`).join(", ")} → "${correct}"\n`;
+    }
+  }
+
+  return prompt;
+}
+
+/**
+ * Step 1-V — /correct LLM 응답 검증 (8 rule 휴리스틱).
+ *
+ * 사료: editor/worker/index.js:2428-2519 (prod validateCorrections)
+ *
+ * 규칙 1: original 이 chunkText 에 존재해야 함
+ * 규칙 2: original === corrected (무의미)
+ * 규칙 3: 30% 미만 축약 (과도)
+ * 규칙 4: filler_removal 에서 corrected > original (환각 삽입)
+ * 규칙 5: 새 단어 3개 이상 (term_correction 제외)
+ * 규칙 6: removed_fillers 가 original 안에 있어야 함
+ * 규칙 7: 중복 change → 마지막 것만 유지
+ * 규칙 8: 고유명사 할루시네이션 (한글↔한글 비음운, dict X)
+ */
+export function validateCorrections(chunkText, result, termDict = []) {
+  if (!result?.chunks) return result;
+
+  const dictMap = new Map();
+  for (const t of termDict) { if (t?.wrong && t?.correct) dictMap.set(t.wrong, t.correct); }
+
+  for (const chunk of result.chunks) {
+    if (!chunk.changes) continue;
+
+    chunk.changes = chunk.changes.filter((change) => {
+      const { original, corrected, type } = change;
+
+      // 규칙 1
+      if (!original || chunkText.indexOf(original) === -1) return false;
+      // 규칙 2
+      if (original.trim() === (corrected || "").trim()) return false;
+      // 규칙 3 (filler_removal/spelling 제외)
+      if (type !== "filler_removal" && type !== "spelling" && corrected !== undefined) {
+        const ratio = corrected.length / original.length;
+        if (ratio < 0.3 && original.length > 10) return false;
+      }
+      // 규칙 4
+      if (type === "filler_removal" && corrected && corrected.length > original.length) return false;
+      // 규칙 5
+      if (corrected && type !== "term_correction") {
+        const origWords = new Set(original.split(/\s+/));
+        const newWords = corrected.split(/\s+/).filter((w) => !origWords.has(w) && w.length > 1);
+        if (newWords.length >= 3) return false;
+      }
+      // 규칙 6
+      if (type === "filler_removal" && change.removed_fillers) {
+        change.removed_fillers = change.removed_fillers.filter((f) => original.includes(f));
+        if (change.removed_fillers.length === 0) return false;
+      }
+      // 규칙 8 — 고유명사 할루시네이션
+      if (type === "term_correction" && original && corrected) {
+        const bothHangul = hangulRatio(original) >= 0.7 && hangulRatio(corrected) >= 0.7;
+        if (bothHangul) {
+          const dictAllowed = dictMap.get(original) === corrected;
+          const phoneticOk = isPhoneticallySimilarKorean(original, corrected);
+          if (!dictAllowed && !phoneticOk) return false;
+        }
+      }
+      return true;
+    });
+
+    // 규칙 7: 중복 → 마지막 것만
+    const seen = new Map();
+    chunk.changes.forEach((ch, idx) => { if (ch.original) seen.set(ch.original, idx); });
+    chunk.changes = chunk.changes.filter((ch, idx) => !ch.original || seen.get(ch.original) === idx);
+  }
+
+  result.chunks = result.chunks.filter((c) => c.changes?.length > 0);
+  return result;
+}
+
+/**
+ * /correct handler — v4 통합 교정 (필러+용어+맞춤법+구어체 단일 호출).
+ *
+ * 사료: editor/worker/index.js:2521-2539 (prod handleCorrect)
+ *
+ * @param body { chunk_text, chunk_index?, total_chunks?, context_blocks?, analysis?, custom_fillers?, custom_terms? }
+ * @returns { success, result, chunk_index?, usage } | error
+ */
+export async function handleCorrect(body, env, headers, user) {
+  if (!body || typeof body !== "object") return badRequest(headers, "body 필수");
+
+  const { chunk_text, chunk_index, total_chunks, context_blocks, analysis, custom_fillers, custom_terms } = body;
+  if (typeof chunk_text !== "string" || chunk_text.length === 0) {
+    return badRequest(headers, "chunk_text is required");
+  }
+
+  if (!env?.OPENAI_API_KEY) {
+    return jsonResponse(
+      { success: false, error: "OPENAI_API_KEY not configured", code: 503 },
+      { status: 503 },
+      headers
+    );
+  }
+
+  const systemPrompt = buildCorrectPrompt(analysis, custom_fillers, custom_terms);
+
+  let userMsg = "";
+  if (context_blocks) userMsg += `[Context reference — do NOT modify]\n${context_blocks}\n\n`;
+  userMsg += `[Correction target — chunk ${(chunk_index || 0) + 1}/${total_chunks || 1}]\n${chunk_text}`;
+
+  // 3회 재시도 (429 rate limit 대응)
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const result = await callOpenAI(env, {
+      model: "gpt-4o-mini",
+      messages: [
+        buildSystemMessage(systemPrompt),  // ★ N4: PROMPT_INJECTION_GUARD prepend
+        { role: "user", content: userMsg },
+      ],
+      temperature: 0,
+      max_tokens: 32000,
+      response_format: { type: "json_object" },
+    });
+
+    if (!result.ok && result.status === 429) {
+      await new Promise((r) => setTimeout(r, (attempt + 1) * 3000));
+      continue;
+    }
+    if (!result.ok) {
+      console.error(logPrefix("/correct"), "callOpenAI failed:", result.error);
+      return jsonResponse(
+        { success: false, error: result.error || "LLM call failed" },
+        { status: result.status >= 400 ? result.status : 502 },
+        headers
+      );
+    }
+
+    const parsed = openaiJSON(result.data);
+    if (!parsed) return serverError(headers, "/correct: JSON parse failed");
+
+    // ★ Step 1-V: 8 rule guardrail
+    const validated = validateCorrections(chunk_text, parsed, analysis?.term_corrections || []);
+
+    return jsonResponse(
+      { success: true, result: validated, chunk_index, usage: result.data?.usage },
+      { status: 200 },
+      headers
+    );
+  }
+  return jsonResponse(
+    { success: false, error: "All retries failed (429 rate limit)" },
+    { status: 500 },
+    headers
+  );
+}
 export const handleHighlights = makeStubHandler("/highlights", "강조자막 2-Pass (Draft + Editor)");
 export const handleTermExplain = makeStubHandler("/term-explain", "용어 설명");
 export const handleVisuals = makeStubHandler("/visuals", "자료·그래픽 추천");

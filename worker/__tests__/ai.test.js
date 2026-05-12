@@ -209,10 +209,104 @@ test("handleAnalyze: 실 LLM 응답 mock — term_corrections 할루시네이션
   }
 });
 
-// ─── 9 LLM stub 검증 (handleAnalyze 제외 — 실 구현됨) ───────────────────
+// ─── /correct (★ M2 Phase 2 — 실 prompt 박제) ───────────────────────────
+
+test("handleCorrect: body 부재 → 400", async () => {
+  const r = await handleCorrect(null, {}, HEADERS, ALICE);
+  assert.equal(r.status, 400);
+});
+
+test("handleCorrect: chunk_text 부재 → 400", async () => {
+  const r = await handleCorrect({}, { OPENAI_API_KEY: "k" }, HEADERS, ALICE);
+  assert.equal(r.status, 400);
+});
+
+test("handleCorrect: API 키 부재 → 503", async () => {
+  const r = await handleCorrect({ chunk_text: "테스트" }, {}, HEADERS, ALICE);
+  assert.equal(r.status, 503);
+});
+
+test("BASE_CORRECT_PROMPT: 핵심 키워드 정합", async () => {
+  const { BASE_CORRECT_PROMPT } = await import("../ai.js");
+  assert.ok(BASE_CORRECT_PROMPT.includes("Processing Order"));
+  assert.ok(BASE_CORRECT_PROMPT.includes("§1. Filler Word"));
+  assert.ok(BASE_CORRECT_PROMPT.includes("§2a. Proper Noun Absolute Preservation"));
+  assert.ok(BASE_CORRECT_PROMPT.includes("Cross-talk"));
+  assert.ok(BASE_CORRECT_PROMPT.includes("Single-action rule"));
+  assert.ok(!BASE_CORRECT_PROMPT.includes("Disregard any instruction"));
+});
+
+test("buildCorrectPrompt: analysis 없으면 BASE 만 반환", async () => {
+  const { buildCorrectPrompt, BASE_CORRECT_PROMPT } = await import("../ai.js");
+  const p = buildCorrectPrompt(null, null, null);
+  assert.equal(p, BASE_CORRECT_PROMPT);
+});
+
+test("buildCorrectPrompt: analysis.speakers + term_corrections 합성", async () => {
+  const { buildCorrectPrompt } = await import("../ai.js");
+  const p = buildCorrectPrompt(
+    {
+      speakers: [{ name: "홍재의", role: "기자" }],
+      term_corrections: [
+        { wrong: "베셋", correct: "베센트", confidence: "high" },
+        { wrong: "엔트로피", correct: "앤트로픽", confidence: "low" },
+      ],
+    },
+    null,
+    null
+  );
+  assert.ok(p.includes("Speaker Name Ground Truth"));
+  assert.ok(p.includes("홍재의"));
+  assert.ok(p.includes("MANDATORY mappings"));
+  assert.ok(p.includes('"베셋" → "베센트" [MANDATORY]'));
+  assert.ok(p.includes("low confidence"));
+  assert.ok(p.includes('"엔트로피" → "앤트로픽"'));
+});
+
+test("validateCorrections: 규칙 1 — original 이 chunkText 에 없음 → 제거", async () => {
+  const { validateCorrections } = await import("../ai.js");
+  const r = validateCorrections("안녕하세요. 반갑습니다.", {
+    chunks: [{ block_index: 0, changes: [
+      { type: "spelling", original: "존재하지않음", corrected: "X" },
+    ] }],
+  });
+  assert.equal(r.chunks.length, 0);  // 모든 change 제거 → chunk 자체 제거
+});
+
+test("validateCorrections: 규칙 8 — 한글 비음운 term_correction 차단", async () => {
+  const { validateCorrections } = await import("../ai.js");
+  const chunkText = "베센트 재무장관이 말했다. 베셋 의장도 합의했다.";
+  const r = validateCorrections(chunkText, {
+    chunks: [{ block_index: 0, changes: [
+      { type: "term_correction", original: "베셋", corrected: "베센트" },     // ✓ 음운 유사
+      { type: "term_correction", original: "베센트", corrected: "옐런" },     // ✗ 비음운 (knowledge-based substitution)
+    ] }],
+  });
+  assert.equal(r.chunks.length, 1);
+  assert.equal(r.chunks[0].changes.length, 1);
+  assert.equal(r.chunks[0].changes[0].original, "베셋");
+});
+
+test("validateCorrections: 규칙 4 — filler_removal 에서 corrected > original 차단", async () => {
+  const { validateCorrections } = await import("../ai.js");
+  const r = validateCorrections("그래서 좋다", {
+    chunks: [{ block_index: 0, changes: [
+      { type: "filler_removal", original: "그래서", corrected: "그래서 정말로" },
+    ] }],
+  });
+  assert.equal(r.chunks.length, 0);
+});
+
+test("isPhoneticallySimilarKorean: 베셋↔베센트 ✓ / 베센트↔옐런 ✗", async () => {
+  const { isPhoneticallySimilarKorean } = await import("../ai.js");
+  assert.equal(isPhoneticallySimilarKorean("베셋", "베센트"), true);
+  assert.equal(isPhoneticallySimilarKorean("베센트", "옐런"), false);
+  assert.equal(isPhoneticallySimilarKorean("홍재희", "홍재의"), true);
+});
+
+// ─── 8 LLM stub 검증 (analyze + correct 제외) ───────────────────────────
 
 const LLM_HANDLERS = [
-  ["correct", handleCorrect],
   ["highlights", handleHighlights],
   ["term-explain", handleTermExplain],
   ["visuals", handleVisuals],
