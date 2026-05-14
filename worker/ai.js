@@ -55,19 +55,28 @@ export async function callOpenAI(env, opts) {
     return { ok: false, status: 400, error: "messages required" };
   }
   try {
+    // ★ 모델별 token 파라미터 분기 (사용자 보고 fix):
+    //   gpt-5* / o1* / o3* (reasoning 계열) → max_completion_tokens
+    //   gpt-4* / gpt-3.5* → max_tokens
+    const model = opts.model || "gpt-4o-mini";
+    const useCompletionTokens = /^(gpt-5|o1|o3)/i.test(model);
+    const tokenLimit = opts.max_tokens || 4096;
+    const body = {
+      model,
+      messages: opts.messages,
+      response_format: opts.response_format,
+      temperature: typeof opts.temperature === "number" ? opts.temperature : 0,
+    };
+    if (useCompletionTokens) body.max_completion_tokens = tokenLimit;
+    else body.max_tokens = tokenLimit;
+
     const r = await fetch(`${OPENAI_BASE}/chat/completions`, {
       method: "POST",
       headers: {
         "Authorization": `Bearer ${env.OPENAI_API_KEY}`,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({
-        model: opts.model || "gpt-4o-mini",
-        messages: opts.messages,
-        response_format: opts.response_format,
-        temperature: typeof opts.temperature === "number" ? opts.temperature : 0,
-        max_tokens: opts.max_tokens || 4096,
-      }),
+      body: JSON.stringify(body),
     });
     if (!r.ok) {
       let errText = `HTTP ${r.status}`;
