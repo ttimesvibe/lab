@@ -1,6 +1,7 @@
 import { useState } from "react";
 
-const AUTH_URL = "https://auth.ttimes6000.workers.dev";
+// ★ lab/test 전용 auth Worker — prod (auth.ttimes6000) 와 완전 분리 (사용자 명시 2026-05-11)
+const AUTH_URL = "https://lab-auth.ttimes.workers.dev";
 
 export function LoginScreen({ onLogin }) {
   const [mode, setMode] = useState("login"); // "login" | "changePassword"

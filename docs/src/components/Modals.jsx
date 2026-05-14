@@ -67,7 +67,8 @@ export function SettingsModal({ config, onSave, onClose }) {
     setPwLoading(true);
     try {
       const token = localStorage.getItem("ttimes_token");
-      const res = await fetch("https://auth.ttimes6000.workers.dev/change-password", {
+      // ★ lab/test 전용 auth Worker (사용자 명시 2026-05-11: prod 와 완전 분리)
+      const res = await fetch("https://lab-auth.ttimes.workers.dev/change-password", {
         method: "POST",
         headers: { "Content-Type": "application/json", "Authorization": `Bearer ${token}` },
         body: JSON.stringify({ currentPassword: pwCur, newPassword: pwNew }),

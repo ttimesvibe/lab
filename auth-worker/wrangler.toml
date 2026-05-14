@@ -1,0 +1,14 @@
+name = "lab-auth"
+main = "index.js"
+compatibility_date = "2024-09-23"
+account_id = "fb0a10864393158e940b149b3ead37f6"  # ttimesvibe (test 환경 — prod 와 완전 분리)
+
+# ⚠️ [placement] 절대 추가 금지!
+# Region은 Cloudflare 대시보드에서 GCP US 수동 설정
+
+[[kv_namespaces]]
+binding = "AUTH"
+id = "b3cf948f8e7048dea7fd1427013d5545"   # lab-auth AUTH (ttimesvibe 계정, ★ prod auth-kv 와 완전 분리)
+
+# Secrets (wrangler secret put 으로 설정):
+# - JWT_SECRET (★ prod auth Worker 와 다른 새 값 — 사용자 명시 2026-05-11: 카니발 근원 차단)

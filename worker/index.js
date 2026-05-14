@@ -1272,7 +1272,8 @@ async function handleProjectRebuildIndex(body, user, env, headers) {
 async function handleTeamMembers(env, headers) {
   // auth Worker에서 팀원 목록을 가져옴
   try {
-    const authUrl = "https://auth.ttimes6000.workers.dev/admin/users";
+    // ★ lab/test 전용 auth Worker (사용자 명시 2026-05-11: prod 와 완전 분리)
+    const authUrl = "https://lab-auth.ttimes.workers.dev/admin/users";
     // JWT_SECRET이 동일하므로 내부 호출용 토큰 생성 대신, auth KV에서 직접 가져올 수 없음
     // → auth Worker의 /admin/users는 admin 전용이므로, editor KV에 team_members를 캐시
     const cached = await env.SESSIONS.get("team_members");
