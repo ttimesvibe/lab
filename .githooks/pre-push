@@ -15,8 +15,8 @@ FORBIDDEN=(
 
 CANONICAL="https://lab.ttimes.workers.dev"
 
-# docs/assets/ + docs/src/ + worker/ 전체 검사
-PATHS="docs/assets docs/src worker"
+# docs/assets/ + docs/src/ + docs/admin/ + worker/ + auth-worker/ 전체 검사
+PATHS="docs/assets docs/src docs/admin worker auth-worker"
 
 found=0
 for bad in "${FORBIDDEN[@]}"; do
