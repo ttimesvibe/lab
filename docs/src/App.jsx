@@ -1490,10 +1490,17 @@ function AuthenticatedApp({ authUser, onLogout, initialSessionId, onBackToDashbo
         if(cfg.apiMode==="live"&&i<chs.length-1) await delay(1000);
       }
 
-      setDiffs(ad); setProg({p:100,l:"✅ 1차 교정 완료"});
+      // ★ _stableId 박제 의무 (2026-05-15) — chunk 영역에 blockIndex/posStart/posEnd/kind 필드 없어
+      //    worker merge.js 의 array_stable_id_union 영역이 fallback key "||||" 동일로 판단 → 모두 1개 압축 손실
+      //    각 chunk 에 고유 ID 박제하면 dedupe 정상 동작 (29개 → 29개 유지)
+      const adWithId = ad.map((d, i) => ({
+        ...d,
+        _stableId: d._stableId || `${Date.now()}-${i}-${Math.random().toString(36).slice(2, 9)}`,
+      }));
+      setDiffs(adWithId); setProg({p:100,l:"✅ 1차 교정 완료"});
       // 자동 KV 저장 (1차 교정 완료)
       // ★ await 의무 (2026-05-15) — 누락 시 PUT 완료 전 탭 이동 → fresh fetch 가 빈 KV 영역으로 state 덮어쓰기 → diffs 손실
-      await autoSaveToKV({ diffs: ad });
+      await autoSaveToKV({ diffs: adWithId });
     } catch(e) { setErr(e.message); setProg({p:0,l:""}); }
     finally { setBusy(false); }
   },[anal, blocks, cfg, autoSaveToKV]);
