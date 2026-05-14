@@ -49,7 +49,7 @@ export const TAB_SCHEMAS = Object.freeze({
     required: [],
   },
   highlight: {
-    fields: ["hl", "hlStats", "hlVerdicts", "hlEdits", "hlMarkers", "clips"],
+    fields: ["hl", "hlStats", "hlVerdicts", "hlEdits", "hlMarkers", "clips", "chapters", "suggestedFlow", "videoTitleSuggestion", "_recommendedAt", "_chaptersGeneratedAt"],
     required: [],
   },
   setgen: {
