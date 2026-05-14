@@ -406,7 +406,8 @@ export async function apiAnalyze(body, cfg) {
 }
 
 export async function apiCorrect(body, cfg) {
-  return await apiCall({ ...LLM_OPTS, url: buildUrl(cfg, "/correct"), method: "POST", body });
+  // /correct 는 15K 자 청크 + max_completion_tokens 16000 — 가장 무거운 호출 (180s 초과 사례 확인됨)
+  return await apiCall({ timeoutMs: 300_000, retry: false, url: buildUrl(cfg, "/correct"), method: "POST", body });
 }
 
 export async function apiHighlights(body, cfg) {

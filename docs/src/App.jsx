@@ -523,7 +523,7 @@ function Header({ authUser, sessionId, activeUsers, onSave, onBackToDashboard, o
 
 function TabBar({ uiTabs, currentUiTab, onChange }) {
   return (
-    <nav style={{ display: "flex", gap: 4, padding: "8px 16px", borderBottom: "1px solid #E5E7EB" }}>
+    <nav style={{ display: "flex", gap: 4, padding: "8px 16px", borderBottom: "1px solid #E5E7EB", overflowX: "auto" }}>
       {uiTabs.map((t) => (
         <button
           key={t}
@@ -535,6 +535,8 @@ function TabBar({ uiTabs, currentUiTab, onChange }) {
             border: "1px solid #E5E7EB",
             borderRadius: 6,
             cursor: "pointer",
+            whiteSpace: "nowrap",  // ★ 한글 라벨 줄바꿈 방지 (사용자 보고)
+            flexShrink: 0,
           }}
         >
           {/* ★ UI key 의 한글 라벨 직접 표시 (script → "스크립트", 사료 §4.2.c 정합) */}
