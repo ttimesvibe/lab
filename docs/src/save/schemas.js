@@ -53,7 +53,7 @@ export const TAB_SCHEMAS = Object.freeze({
     required: [],
   },
   setgen: {
-    fields: ["sets", "result", "sel", "edits"],
+    fields: ["sets", "result", "sel", "edits", "trendData", "trendingNow", "keywordsExtracted", "notableQuotes", "focusKeyword", "guestName", "guestTitle", "_generatedAt"],
     required: [],
   },
   metadata: {
