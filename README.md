@@ -1,14 +1,38 @@
 # lab — ttimes-editor (test 환경)
 
-★ 본 repo 는 `ttimesvibe/editor` (prod) 의 **clone**. 동일 application 코드 + lab 전용 인프라 (Worker `lab` / KV `lab-sessions` / Pages `/lab/`).
+★ 본 repo 는 `ttimesvibe/editor` (prod) 의 **clone**. 동일 application 코드 + lab 전용 인프라.
 
 prod 와의 차이는 **인프라 분리만** — 코드 자체는 prod 와 동일.
 
-- **사용자 명시 원칙** (2026-05-11):
-  1. prod 와 같은 기능 구현
-  2. prod 의 데이터/URL 겹치면 X
-  3. worker 데이터 섞이면 X
-- **이전 lab fresh v2 시도 폐기 박제**: `editor/ops/POSTMORTEM_LAB_FRESH_DECOMMISSION_20260511.md`
+## 인프라 매트릭스
+
+| 영역 | prod | lab (현 repo) |
+|---|---|---|
+| 메인 Pages | `ttimesvibe.github.io/editor/` | `ttimesvibe.github.io/lab/` |
+| Admin Pages | `ttimesvibe.github.io/admin/` (별 repo) | `ttimesvibe.github.io/lab/admin/` (본 repo 내 `docs/admin/`) |
+| 메인 Worker | `alleditor.ttimes6000.workers.dev` (ttimes6000) | `lab.ttimes.workers.dev` (ttimesvibe) |
+| Auth Worker | `auth.ttimes6000.workers.dev` (ttimes6000) | `lab-auth.ttimes.workers.dev` (ttimesvibe) |
+| 메인 KV | `editor-session` (id `2892f3a4...`) | `lab-sessions` (id `fbb8da8a...`) |
+| Auth KV | `auth-kv` (id `52ba7093...`) | `AUTH` (id `b3cf948f...`) |
+| JWT_SECRET | prod 전용 | lab 전용 (★ 별 값 — 토큰 비호환) |
+
+## 사용자 명시 원칙 (2026-05-11)
+
+1. prod 와 같은 기능 구현
+2. prod 의 데이터/URL 겹치면 X
+3. worker 데이터 섞이면 X — **카니발 근원 모두 차단**
+
+## 폐기된 옛 자원 (★ 2026-05-11 정리 완료)
+
+| 자원 | 상태 |
+|---|---|
+| `ttimesvibe/ttimes-editor` (GitHub) | ✅ 삭제 (404) |
+| Worker `editor` (editor.ttimes.workers.dev) | ✅ 삭제 |
+| Worker `ttimes-edit` (옛 죽은 worker) | ✅ 삭제 |
+| KV `editor-sessions` (옛 test, 82 keys) | ✅ 삭제 (lab-sessions 마이그레이션 완료 + 7.5MB 백업 보존) |
+| KV `ttimes-editor-sessions` (legacy, 8 keys) | ✅ 삭제 |
+
+★ 이전 lab fresh v2 시도 폐기 사후 분석 — `editor/ops/POSTMORTEM_LAB_FRESH_DECOMMISSION_20260511.md`
 
 영상 편집/교정 CMS. 프론트엔드 (GitHub Pages) + 백엔드 (Cloudflare Worker) 독립 배포.
 
