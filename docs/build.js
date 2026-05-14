@@ -1,160 +1,113 @@
-// lab fresh v2 — frontend build script (drift guard pre+post)
-// 사료: editor/ops/lab-v2-fresh-2026-05-09.md (S5.1 A14.1 + S2.6)
-//
-// 책임:
-//   1. PREBUILD drift guard — config.js 의 workerUrl 이 canonical 인지
-//   2. vite build
-//   3. dist → docs/ 복사
-//   4. STALE 번들 auto-purge (index.html 미참조 assets/*.js 삭제)
-//   5. POSTBUILD drift guard — assets/*.js 에 forbidden URL 잔존 X 검증
+// Build helper: swap index.html to dev entry → vite build → copy dist output back
+// + Drift guard: ensure config.js workerUrl is canonical and no stale URLs leak into bundle
+// + Stale-bundle purge: remove assets/*.js not referenced by index.html
+import { readFileSync, writeFileSync, cpSync, readdirSync, unlinkSync } from "fs";
+import { execSync } from "child_process";
+import { join } from "path";
 
-import { execSync } from "node:child_process";
-import {
-  readFileSync, writeFileSync, readdirSync,
-  copyFileSync, existsSync, mkdirSync, unlinkSync,
-} from "node:fs";
-import { join } from "node:path";
-import { fileURLToPath } from "node:url";
-import { dirname } from "node:path";
+const indexPath = "index.html";
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
-
-// ★ Canonical worker URL (lab 전용)
-// docs/src/utils/config.js 의 DEFAULT_CONFIG.workerUrl 과 같은 commit 에서 함께 수정 의무
+// Canonical lab (test) worker URL — single source of truth for drift detection
+// ★ 본 repo 는 prod editor 의 clone 이지만 lab Worker 가리킴 — prod 와 데이터 분리 의무 (사용자 원칙 2/3)
 const CANONICAL_WORKER_URL = "https://lab.ttimes.workers.dev";
-
-// ★ Forbidden URLs — prod / 옛 test / 옛 worker 잔존 차단
+// Any previously-used URL that must NEVER appear in shipped bundles
+// 번들에 절대 들어가면 안 되는 URL (PROD 로의 역방향 drift 방지 — lab → prod KV 섞임 차단)
 const FORBIDDEN_WORKER_URLS = [
-  "alleditor.ttimes6000.workers.dev",        // prod editor
-  "editor.ttimes.workers.dev",               // 옛 test (Phase 3 폐기 예정)
-  "ttimes-edit.ttimes.workers.dev",          // 옛 worker (4/12 죽음)
+  "https://alleditor.ttimes6000.workers.dev",       // ★ 실제 PROD worker URL — lab 이 잘못 호출하면 prod KV 섞임
+  "https://editor.ttimes.workers.dev",              // 옛 test worker (Phase 8 폐기 예정)
+  "https://ttimes-edit.ttimes.workers.dev",         // 옛 worker (4/12 죽음)
 ];
 
-const CONFIG_PATH = join(__dirname, "src", "utils", "config.js");
-const INDEX_HTML = join(__dirname, "index.html");
-const DIST_DIR = join(__dirname, "dist");
-const ASSETS_DIR = join(__dirname, "assets");
-
-// 1. PREBUILD DRIFT GUARD
-function prebuildDriftGuard() {
-  console.log("▶ prebuild drift guard");
-  if (!existsSync(CONFIG_PATH)) {
-    console.warn("  ⚠️ config.js 없음 — skip");
-    return;
-  }
-  const content = readFileSync(CONFIG_PATH, "utf-8");
-  if (!content.includes(CANONICAL_WORKER_URL)) {
-    console.error(`❌ prebuild: config.js workerUrl ≠ canonical (${CANONICAL_WORKER_URL})`);
+// ─────────────────────────────────────────────
+// Prebuild drift guard: config.js workerUrl must be canonical
+// ─────────────────────────────────────────────
+const cfgPath = "src/utils/config.js";
+const cfgSrc = readFileSync(cfgPath, "utf8");
+const cfgUrlMatch = cfgSrc.match(/workerUrl:\s*"([^"]+)"/);
+if (!cfgUrlMatch) {
+  console.error(`❌ drift-guard: ${cfgPath} 에서 workerUrl 을 찾을 수 없습니다`);
+  process.exit(1);
+}
+if (cfgUrlMatch[1] !== CANONICAL_WORKER_URL) {
+  console.error(`❌ drift-guard: ${cfgPath} workerUrl 이 canonical 과 다릅니다`);
+  console.error(`   expected: ${CANONICAL_WORKER_URL}`);
+  console.error(`   actual:   ${cfgUrlMatch[1]}`);
+  process.exit(1);
+}
+for (const bad of FORBIDDEN_WORKER_URLS) {
+  if (cfgSrc.includes(bad)) {
+    console.error(`❌ drift-guard: ${cfgPath} 에 금지된 URL 포함 — ${bad}`);
     process.exit(1);
   }
-  for (const forbidden of FORBIDDEN_WORKER_URLS) {
-    if (content.includes(forbidden)) {
-      console.error(`❌ prebuild: config.js 에 forbidden URL 잔존 — ${forbidden}`);
-      process.exit(1);
-    }
+}
+console.log(`✅ drift-guard (pre): config.js workerUrl = ${CANONICAL_WORKER_URL}`);
+
+// Step 1: Swap index.html to use source entry for Vite
+let html = readFileSync(indexPath, "utf8");
+const prodScript = html.match(/<script[^>]*src="[^"]*"[^>]*><\/script>/)?.[0];
+html = html.replace(/<script[^>]*src="[^"]*"[^>]*><\/script>/, '<script type="module" src="/src/main.jsx"></script>');
+writeFileSync(indexPath, html);
+console.log("✅ index.html → dev entry");
+
+// Step 2: Run vite build
+try {
+  execSync("npx vite build", { stdio: "inherit" });
+} catch (e) {
+  // Restore original on failure
+  if (prodScript) {
+    html = readFileSync(indexPath, "utf8");
+    html = html.replace(/<script[^>]*src="[^"]*"[^>]*><\/script>/, prodScript);
+    writeFileSync(indexPath, html);
   }
-  console.log(`  ✅ config.js → ${CANONICAL_WORKER_URL}`);
+  process.exit(1);
 }
 
-// ★ pre-vite: index.html 을 dev entry 로 swap (사고 영구 fix)
-// 이전 build 가 production script src (`/lab/assets/index_build-*.js`) 를 박았을
-// 때 vite re-build 가 이를 input 으로 resolve 시도 → 실패. 사전 swap 으로 차단.
-function swapIndexToDevEntry() {
-  console.log("▶ index.html → dev entry swap");
-  if (!existsSync(INDEX_HTML)) return;
-  let html = readFileSync(INDEX_HTML, "utf-8");
-  // production: <script type="module" crossorigin src="/lab/assets/index_build-*.js"></script>
-  // dev:        <script type="module" src="/src/main.jsx"></script>
-  const re = /<script\s+type="module"(?:\s+crossorigin)?\s+src="\/lab\/assets\/index_build-[^"]+\.js"><\/script>/;
-  if (re.test(html)) {
-    html = html.replace(re, '<script type="module" src="/src/main.jsx"></script>');
-    writeFileSync(INDEX_HTML, html);
-    console.log("  ✅ production → dev entry");
-  } else if (html.includes('/src/main.jsx')) {
-    console.log("  ✅ 이미 dev entry — skip");
-  } else {
-    console.warn("  ⚠️ index.html 에 script 태그를 식별 못 함 — vite build 가 실패할 수 있음");
-  }
-}
+// Step 3: Copy dist output to docs root
+cpSync("dist/assets", "assets", { recursive: true });
+cpSync("dist/index.html", indexPath);
+console.log("✅ dist → docs root copied");
 
-// 2. VITE BUILD
-function viteBuild() {
-  console.log("▶ vite build");
-  execSync("npx -y vite build", { stdio: "inherit", cwd: __dirname });
-}
-
-// 3. dist → docs/ 복사
-function copyDistToDocs() {
-  console.log("▶ dist → docs/ 복사");
-  if (!existsSync(DIST_DIR)) {
-    console.error("❌ dist/ 없음 — vite build 실패?");
-    process.exit(1);
-  }
-  // dist/index.html → docs/index.html
-  copyFileSync(join(DIST_DIR, "index.html"), INDEX_HTML);
-  // dist/assets/* → docs/assets/*
-  if (!existsSync(ASSETS_DIR)) mkdirSync(ASSETS_DIR);
-  const distAssets = join(DIST_DIR, "assets");
-  if (existsSync(distAssets)) {
-    for (const f of readdirSync(distAssets)) {
-      copyFileSync(join(distAssets, f), join(ASSETS_DIR, f));
-    }
-  }
-  console.log("  ✅ 복사 완료");
-}
-
-// 4. STALE 번들 auto-purge
-function stalePurge() {
-  console.log("▶ stale 번들 auto-purge");
-  if (!existsSync(ASSETS_DIR)) return;
-  const html = readFileSync(INDEX_HTML, "utf-8");
+// Step 3b: Purge stale bundles not referenced by current index.html
+{
+  const finalHtml = readFileSync(indexPath, "utf8");
   const referenced = new Set();
-  for (const m of html.matchAll(/assets\/([^"'\s>]+)/g)) {
-    referenced.add(m[1]);
+  const jsRefRegex = /assets\/([A-Za-z0-9_\-]+\.js)/g;
+  let m;
+  while ((m = jsRefRegex.exec(finalHtml)) !== null) referenced.add(m[1]);
+  const allJs = readdirSync("assets").filter(f => f.endsWith(".js"));
+  const toDelete = allJs.filter(f => !referenced.has(f));
+  for (const f of toDelete) {
+    unlinkSync(`assets/${f}`);
+    console.log(`🗑  stale bundle 제거: ${f}`);
   }
-  let purged = 0;
-  for (const f of readdirSync(ASSETS_DIR)) {
-    if (!referenced.has(f) && f.endsWith(".js")) {
-      unlinkSync(join(ASSETS_DIR, f));
-      purged++;
-    }
-  }
-  console.log(`  ✅ ${purged} stale bundle 삭제`);
+  if (toDelete.length === 0) console.log("✅ stale bundle 없음");
 }
 
-// 5. POSTBUILD DRIFT GUARD
-function postbuildDriftGuard() {
-  console.log("▶ postbuild drift guard");
-  if (!existsSync(ASSETS_DIR)) return;
-  let found = false;
-  let canonicalSeen = false;
-  for (const f of readdirSync(ASSETS_DIR)) {
-    if (!f.endsWith(".js")) continue;
-    const content = readFileSync(join(ASSETS_DIR, f), "utf-8");
-    for (const forbidden of FORBIDDEN_WORKER_URLS) {
-      if (content.includes(forbidden)) {
-        console.error(`❌ postbuild: ${f} 에 forbidden URL 잔존 — ${forbidden}`);
-        found = true;
-      }
+// ─────────────────────────────────────────────
+// Postbuild drift guard: bundled JS must have canonical URL only
+// ─────────────────────────────────────────────
+const assetsDir = "assets";
+const jsFiles = readdirSync(assetsDir).filter(f => f.endsWith(".js"));
+let driftFound = false;
+for (const f of jsFiles) {
+  const src = readFileSync(join(assetsDir, f), "utf8");
+  for (const bad of FORBIDDEN_WORKER_URLS) {
+    if (src.includes(bad)) {
+      console.error(`❌ drift-guard (post): ${f} 에 금지된 URL 잔존 — ${bad}`);
+      driftFound = true;
     }
-    if (content.includes(CANONICAL_WORKER_URL)) canonicalSeen = true;
   }
-  if (found) {
-    console.error("   대응: src/utils/config.js 의 workerUrl 검증");
-    process.exit(1);
+  if (!src.includes(CANONICAL_WORKER_URL)) {
+    // Non-entry chunks may not reference the URL at all — only warn if no JS file has it
   }
-  if (!canonicalSeen) {
-    console.warn(`  ⚠️ assets/*.js 에 ${CANONICAL_WORKER_URL} 미발견 — config.js 미사용?`);
-  }
-  console.log("  ✅ forbidden URL 0건");
 }
-
-// MAIN
-prebuildDriftGuard();
-swapIndexToDevEntry();
-viteBuild();
-copyDistToDocs();
-stalePurge();
-postbuildDriftGuard();
-console.log("✅ build 완료");
+if (driftFound) {
+  console.error(`❌ drift-guard (post): 빌드 결과에서 drift 감지됨, 배포 금지`);
+  process.exit(1);
+}
+const anyHasCanonical = jsFiles.some(f => readFileSync(join(assetsDir, f), "utf8").includes(CANONICAL_WORKER_URL));
+if (!anyHasCanonical) {
+  console.error(`❌ drift-guard (post): 빌드 결과 어떤 JS 에도 canonical workerUrl 이 없습니다`);
+  process.exit(1);
+}
+console.log(`✅ drift-guard (post): 번들 ${jsFiles.length}개 검사 완료, drift 없음`);

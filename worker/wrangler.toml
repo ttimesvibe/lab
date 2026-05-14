@@ -1,43 +1,22 @@
-# lab fresh v2 — Cloudflare Worker 설정
-# 사료: editor/ops/lab-v2-fresh-2026-05-09.md (S5.1 A14.2 + S2.6)
-
 name = "lab"
 main = "index.js"
 compatibility_date = "2024-01-01"
-account_id = "fb0a10864393158e940b149b3ead37f6"  # ttimesvibe (prod editor 의 ttimes6000 과 분리)
+account_id = "fb0a10864393158e940b149b3ead37f6"  # ttimesvibe (test 환경 — prod 와 분리)
 
-# KV namespace — lab-sessions (별 namespace)
-# prod editor-session (id 2892f3a4...) 과 분리. 환경 격리 다층 방어 핵심.
+# ⚠️ [placement] 절대 추가 금지!
+# wrangler deploy 시 대시보드 Region 설정이 덮어씌워짐
+# Region은 Cloudflare 대시보드에서 수동 설정 (GCP US)
+
 [[kv_namespaces]]
 binding = "SESSIONS"
-id = "fbb8da8adcae4ee0a555abff66f798ac"
+id = "fbb8da8adcae4ee0a555abff66f798ac"   # lab-sessions (★ prod editor-session 과 분리 — 데이터 섞임 차단)
 
-# Cron — lab 미적용
-# 사용자 명시 결정: Phase B 정합. 운영 측정 (heartbeat / 폴링 부하) 후 결정.
+# Cron Trigger 명시 영역 비움 — 영구 삭제는 자동화하지 않음 (B 안 정책).
+# 관리자가 주기적으로 /projects/trash 확인 후 /projects/trash/purge 로 일괄 처리.
 [triggers]
 crons = []
 
-# Secrets (wrangler secret put 으로 설정 — 사용자 직접 입력 의무):
-#
-#   cd lab/worker
-#   CLOUDFLARE_ACCOUNT_ID=fb0a10864393158e940b149b3ead37f6 npx -y wrangler secret put OPENAI_API_KEY
-#   CLOUDFLARE_ACCOUNT_ID=fb0a10864393158e940b149b3ead37f6 npx -y wrangler secret put GEMINI_API_KEY
-#   CLOUDFLARE_ACCOUNT_ID=fb0a10864393158e940b149b3ead37f6 npx -y wrangler secret put JWT_SECRET
-#
-# 사용자 결정 (S3.8):
-# - OPENAI_API_KEY  : prod 와 같은 값
-# - GEMINI_API_KEY  : prod 와 같은 값
-# - JWT_SECRET      : ★ prod 와 다른 값 (test 토큰이 prod 와 안 섞이게)
-#
-# 보안: secret 평문 저장 금지 (PS14 영원 close). git 히스토리에 키 흔적 0.
-
-# ⚠️ 절대 금지 (영구 박제)
-# 1. [placement] 블록 추가
-#    → Cloudflare 대시보드 region 설정 (GCP US) 가 덮어씌워짐
-#    → pre-push hook 이 차단함 (.githooks/pre-push)
-#
-# 2. account_id 변경
-#    → Worker 와 KV 가 다른 계정에 배치되면 binding 동작 안 함
-#
-# 3. KV id 변경
-#    → 옛 test (`9e4f5bb9...` editor-sessions) 또는 prod (`2892f3a4...` editor-session) 로 변경 시 KV 섞임 사고
+# Secrets (wrangler secret put 으로 설정):
+# - OPENAI_API_KEY (prod 와 동일 — 사용자 결정 36)
+# - GEMINI_API_KEY (prod 와 동일 — 사용자 결정 36)
+# - JWT_SECRET (prod 와 같은 값 — 사용자 결정 37, 같은 origin localStorage 공유 호환)

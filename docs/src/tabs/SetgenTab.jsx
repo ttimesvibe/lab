@@ -1,285 +1,364 @@
-// lab fresh v2 — SetgenTab (★ 실 UI Phase 8 — /setgen multi-step)
-// 사료: S2.4.2.h 세트 + worker SETGEN_KEYWORD_SYSTEM + makeSetgenPrompt 4 type
-//
-// /setgen multi-step (worker 측 약 60-120초):
-//   Step 1: 키워드 + 인상 발언 추출 (gpt-4.1 temp 0.3)
-//   Step 2: 트렌드 데이터 병렬 수집 (Google Trends RSS + YT/Google Suggestions + News RSS)
-//   Step 3: 3 type 후보 병렬 GPT (balanced + trend + [focus|script])
+import { useState, useCallback, useRef, useEffect } from "react";
+import { C, FN } from "../utils/styles.js";
+import { apiSetgen, apiHlTimestamps } from "../utils/api.js";
 
-import { useState } from "react";
-import { apiSetgen } from "../utils/api.js";
+const SLOPE = 0.001210;
+const INTERCEPT = 7.05;
+const predictMinutes = (totalChars) => SLOPE * totalChars + INTERCEPT;
 
-const TYPE_STYLES = {
-  balanced: { color: "#3b82f6", bg: "#dbeafe", label: "⚖️ 밸런스형" },
-  trend:    { color: "#ef4444", bg: "#fee2e2", label: "🔍 시의성 극대화" },
-  script:   { color: "#10b981", bg: "#d1fae5", label: "📝 스크립트 충실" },
-  focus:    { color: "#8b5cf6", bg: "#ede9fe", label: "🎯 선택과 집중" },
-};
-
-export function SetgenTab({ tabId, data, allTabData, onSave, onMultiSave, sessionId, config, currentTab, authUser }) {
-  const result = data?.result || null;
-  const trendData = data?.trendData || {};
-  const trendingNow = data?.trendingNow || [];
-  const keywordsExtracted = data?.keywordsExtracted || [];
-  const notableQuotes = data?.notableQuotes || [];
-
-  // 입력 — correction.blocks 또는 cleanText 우선
-  const correctionBlocks = allTabData?.correction?.blocks || [];
-  const cleanText = allTabData?.review?.cleanText || allTabData?.manuscript?.text || "";
-  const projectName = allTabData?.meta?.fn || "";
-
-  const [running, setRunning] = useState(false);
-  const [progress, setProgress] = useState("");
-  const [error, setError] = useState("");
-  const [focusKeyword, setFocusKeyword] = useState(data?.focusKeyword || "");
-  const [guestName, setGuestName] = useState(data?.guestName || "");
-  const [guestTitle, setGuestTitle] = useState(data?.guestTitle || "");
-
-  function getInputScript() {
-    if (correctionBlocks.length > 0) {
-      return correctionBlocks
-        .filter((b) => b.text && b.text.trim().length > 0)
-        .map((b) => `[${b.speaker || "화자"}] ${b.text}`)
-        .join("\n\n");
+function findBestMatch(blockText, clipText) {
+  let idx = blockText.indexOf(clipText);
+  if (idx >= 0) return { start: idx, end: idx + clipText.length, exact: true };
+  const minChunk = 3;
+  if (clipText.length < minChunk) return null;
+  let bestStart = -1, bestEnd = -1, bestLen = 0;
+  for (let len = Math.min(clipText.length, 40); len >= minChunk; len -= 5) {
+    const headChunk = clipText.substring(0, len);
+    const hIdx = blockText.indexOf(headChunk);
+    if (hIdx >= 0 && len > bestLen) {
+      const tailChunk = clipText.slice(-Math.min(len, 30));
+      const tIdx = blockText.indexOf(tailChunk, hIdx);
+      if (tIdx >= 0) { bestStart = hIdx; bestEnd = tIdx + tailChunk.length; bestLen = bestEnd - bestStart; break; }
+      else { bestStart = hIdx; bestEnd = Math.min(hIdx + clipText.length + 10, blockText.length); bestLen = len; }
     }
-    return cleanText;
   }
+  if (bestStart >= 0 && bestLen >= minChunk) return { start: bestStart, end: bestEnd, exact: false };
+  for (let len = Math.min(clipText.length, 40); len >= minChunk; len -= 5) {
+    const tailChunk = clipText.slice(-len);
+    const tIdx = blockText.indexOf(tailChunk);
+    if (tIdx >= 0) return { start: Math.max(0, tIdx - clipText.length + len), end: tIdx + tailChunk.length, exact: false };
+  }
+  return null;
+}
 
-  async function handleStartSetgen() {
-    if (running) return;
-    const script = getInputScript();
-    if (script.length < 200) {
-      setError("입력 텍스트가 너무 짧습니다 (최소 200자).");
+const TYPE_LABELS = { balanced: "밸런스", trend: "트렌드 공략", focus: "선택과 집중", script: "스크립트 충실" };
+const TYPE_COLORS = {
+  balanced: { bg: "rgba(91,76,212,0.08)", bd: "rgba(91,76,212,0.2)", tx: "#5B4CD4" },
+  trend: { bg: "rgba(59,130,246,0.06)", bd: "rgba(59,130,246,0.15)", tx: "#2563EB" },
+  focus: { bg: "rgba(234,88,12,0.06)", bd: "rgba(234,88,12,0.15)", tx: "#EA580C" },
+  script: { bg: "rgba(168,85,247,0.06)", bd: "rgba(168,85,247,0.15)", tx: "#9333EA" },
+};
+const SRC_BADGE = {
+  trend: { label: "trend", bg: "rgba(59,130,246,0.06)", bd: "rgba(59,130,246,0.15)", tx: "#2563EB" },
+  script: { label: "script", bg: "rgba(168,85,247,0.06)", bd: "rgba(168,85,247,0.15)", tx: "#9333EA" },
+  both: { label: "both", bg: "rgba(217,119,6,0.08)", bd: "rgba(217,119,6,0.2)", tx: "#D97706" },
+};
+const FIELDS = ["thumbnail", "youtube_title", "description"];
+const FLABELS = { thumbnail: "썸네일/리스트 제목", youtube_title: "유튜브 제목", description: "유튜브 설명/기사/페북" };
+
+export function SetgenTab({ script, blocks, guestName, guestTitle, sessionId, config, onSave, keywords: suggestedKeywords, currentTab, initialData }) {
+  const [gN, setGN] = useState(guestName || "");
+  const [gT, setGT] = useState(guestTitle || "");
+  const [result, setResult] = useState(null);
+  const [trendData, setTrendData] = useState(null);
+  const [trendingNow, setTrendingNow] = useState([]);
+  const [keywords, setKeywords] = useState([]);
+  const [sel, setSel] = useState({});
+  const [edits, setEdits] = useState({});
+  const [loading, setLoading] = useState(false);
+  const [loadMsg, setLoadMsg] = useState("");
+  const [err, setErr] = useState(null);
+  const [copied, setCopied] = useState(false);
+  const [showTrend, setShowTrend] = useState(false);
+  const [focusKw, setFocusKw] = useState("");
+  const [timestamps, setTimestamps] = useState(null);
+  const [showTimestamps, setShowTimestamps] = useState(true);
+  const [tsLoading, setTsLoading] = useState(false);
+  const [tsCopied, setTsCopied] = useState(false);
+
+  useEffect(() => { if (guestName) setGN(guestName); }, [guestName]);
+  useEffect(() => { if (guestTitle) setGT(guestTitle); }, [guestTitle]);
+
+  // initialData에서 복원 (페이지 새로고침 후)
+  const restoredRef = useRef(false);
+  // M3.a — 약속 Y 영역의 명시 신호: initialData → setX → onSave 영역 skip
+  const justLoadedRef = useRef(false);
+  useEffect(() => {
+    if (restoredRef.current || !initialData) return;
+    if (initialData.result) {
+      justLoadedRef.current = true;  // ← M3.a: 약속 Y 신호
+      setResult(initialData.result);
+      restoredRef.current = true;
+    }
+    if (initialData.trendData) setTrendData(initialData.trendData);
+    if (initialData.trendingNow) setTrendingNow(initialData.trendingNow);
+    if (initialData.keywords) setKeywords(initialData.keywords);
+    if (initialData.selections) setSel(initialData.selections);
+    if (initialData.edits) setEdits(initialData.edits);
+    if (initialData.focusKeyword) setFocusKw(initialData.focusKeyword);
+    if (initialData.timestamps) setTimestamps(initialData.timestamps);
+  }, [initialData]);
+
+  // 탭 비활성화 시 즉시 저장
+  const prevTabRef = useRef(currentTab);
+  useEffect(() => {
+    if (prevTabRef.current === "setgen" && currentTab !== "setgen") {
+      if (result && onSave) {
+        onSave({ result, trendData, trendingNow, keywords, selections: sel, edits, focusKeyword: focusKw, timestamps, savedAt: new Date().toISOString() });
+      }
+    }
+    prevTabRef.current = currentTab;
+  }, [currentTab]);
+
+  // CMS v2 — 자식 → 부모 즉시 onSave (디바운스 X). 부모가 KV PUT 디바운스 처리.
+  useEffect(() => {
+    if (!onSave || !result) return;
+    // M3.a — 약속 Y: initialData 영역의 onSave 호출 영역 skip
+    if (justLoadedRef.current) {
+      justLoadedRef.current = false;  // 신호 소비
       return;
     }
-    setRunning(true);
-    setError("");
-    setProgress("세트 생성 중... (트렌드 RSS + 3 GPT 병렬, 60-120초 소요)");
+    onSave({ result, trendData, trendingNow, keywords, selections: sel, edits, focusKeyword: focusKw, timestamps, savedAt: new Date().toISOString() });
+  }, [result, sel, edits, timestamps]);
 
-    try {
-      const r = await apiSetgen({
-        script,
-        guest_name: guestName.trim() || undefined,
-        guest_title: guestTitle.trim() || undefined,
-        focus_keyword: focusKeyword.trim() || undefined,
-      }, config);
-      if (!r?.success || !r?.result) {
-        throw new Error("setgen 실패: " + (r?.error || "응답 형식 X"));
-      }
-
-      onSave({
-        ...data,
-        result: r.result,
-        trendData: r.trend_data || {},
-        trendingNow: r.trending_now || [],
-        keywordsExtracted: r.keywords_extracted || [],
-        notableQuotes: r.notable_quotes || [],
-        focusKeyword: r.focus_keyword || focusKeyword,
-        guestName,
-        guestTitle,
-        _generatedAt: new Date().toISOString(),
-      });
-      setProgress(`✅ 3 후보 세트 생성됨 (태그 ${(r.result.tags || []).length}, 썸네일 ${(r.result.thumbnail || []).length}, 제목 ${(r.result.youtube_title || []).length})`);
-    } catch (e) {
-      console.error("[SetgenTab] setgen error:", e);
-      setError(e?.message || String(e));
-      setProgress("");
-    } finally {
-      setRunning(false);
+  const scriptBlocks = blocks?.length > 0 ? blocks : (() => {
+    const lines = (script || "").split("\n").filter(l => l.trim());
+    const res = [];
+    let id = 0;
+    const speakerRe = /^([가-힣a-zA-Z]+)\s+(\d{1,2}:\d{2}(?::\d{2})?)/;
+    let current = null;
+    for (const line of lines) {
+      const m = line.match(speakerRe);
+      if (m) {
+        if (current) res.push(current);
+        current = { speaker: m[1], time: m[2], text: line.substring(m[0].length).trim(), id: id++ };
+      } else if (current) { current.text += " " + line.trim(); }
     }
-  }
+    if (current) res.push(current);
+    return res;
+  })();
 
-  const hasInput = correctionBlocks.length > 0 || cleanText.length > 200;
-  const tags = result?.tags || [];
-  const thumbnails = result?.thumbnail || [];
-  const titles = result?.youtube_title || [];
-  const descriptions = result?.description || [];
+  const generateTimestamps = useCallback(async () => {
+    if (!script) return;
+    setTsLoading(true); setErr(null);
+    try {
+      const tsResult = await apiHlTimestamps(script, config);
+      const chapters = tsResult.chapters || [];
+      const totalChars = scriptBlocks.reduce((s, b) => s + (b.text || "").length, 0);
+      const totalMin = predictMinutes(totalChars);
+      const fullText = scriptBlocks.map(b => b.text || "").join(" ");
+      const withTimes = chapters.map((ch, i) => {
+        let charPos = 0;
+        if (i > 0) {
+          const match = findBestMatch(fullText, ch.anchor_text || "");
+          charPos = match ? match.start : Math.round((i / chapters.length) * fullText.length);
+        }
+        const ratio = charPos / fullText.length;
+        const timeMin = ratio * totalMin;
+        const mm = Math.floor(timeMin);
+        const ss = Math.round((timeMin - mm) * 60);
+        return { ...ch, time: `${mm}:${ss.toString().padStart(2, "0")}`, ratio, charPos };
+      });
+      setTimestamps(withTimes);
+      setShowTimestamps(true);
+    } catch (e) { setErr("타임스탬프 생성 실패: " + e.message); }
+    finally { setTsLoading(false); }
+  }, [script, scriptBlocks, config]);
 
-  return (
-    <div className="tab tab-setgen">
-      <h2 style={{ margin: "0 0 12px 0" }}>세트 (YouTube 메타 + 트렌드)</h2>
+  const copyTimestamps = () => {
+    if (!timestamps) return;
+    navigator.clipboard.writeText(timestamps.map(t => `${t.time} ${t.title}`).join("\n"));
+    setTsCopied(true); setTimeout(() => setTsCopied(false), 2000);
+  };
 
-      {/* 입력 폼 */}
-      <div style={{ marginBottom: 16, padding: 12, background: "#f9fafb", borderRadius: 6 }}>
-        <div style={{ fontSize: 11, fontWeight: 700, color: "#666", textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 8 }}>
-          세트 생성 옵션 (선택)
+  const generate = useCallback(async () => {
+    if (!script?.trim()) { setErr("원고를 먼저 업로드하세요."); return; }
+    setLoading(true); setErr(null); setResult(null); setTrendData(null); setTrendingNow([]); setKeywords([]); setSel({}); setEdits({});
+    const t0 = Date.now();
+    const thirdLabel = focusKw.trim() ? "선택과집중" : "스크립트";
+    const timer = setInterval(() => {
+      const s = Math.round((Date.now() - t0) / 1000);
+      if (s < 5) setLoadMsg("1. 키워드 추출 중...");
+      else if (s < 12) setLoadMsg("2. 트렌드 수집 중 (YouTube/Google/Trends/News)...");
+      else if (s < 20) setLoadMsg("3. 밸런스형 세트 생성 중...");
+      else if (s < 28) setLoadMsg("4. 트렌드형 세트 생성 중...");
+      else if (s < 36) setLoadMsg("5. " + thirdLabel + "형 세트 생성 중...");
+      else setLoadMsg("결과 취합 중... (" + s + "초)");
+    }, 1000);
+    try {
+      const data = await apiSetgen(script, gN, gT, focusKw, config);
+      clearInterval(timer);
+      setResult(data.result);
+      setTrendData(data.trend_data || null);
+      setTrendingNow(data.trending_now || []);
+      setKeywords(data.keywords_extracted || []);
+      const s = {}; FIELDS.forEach(k => { s[k] = 0; }); setSel(s);
+    } catch (e) { setErr(e.message); }
+    finally { setLoading(false); setLoadMsg(""); clearInterval(timer); }
+  }, [script, gN, gT, focusKw, config]);
+
+  const getDisplay = (key, idx) => {
+    if (!result || !result[key] || !result[key][idx]) return "";
+    const item = result[key][idx];
+    return key === "thumbnail" ? (item.lines || []).join("\n") : (item.text || "");
+  };
+  const getSelected = (key) => { const idx = sel[key] ?? 0; const ek = key + "-" + idx; return edits[ek] !== undefined ? edits[ek] : getDisplay(key, idx); };
+
+  const copyAll = () => {
+    const parts = FIELDS.map(k => "<" + FLABELS[k] + ">\n" + getSelected(k));
+    if (result?.tags) parts.push("<태그>\n" + result.tags.map(t => t.tag).join(", "));
+    navigator.clipboard.writeText(parts.join("\n\n"));
+    setCopied(true); setTimeout(() => setCopied(false), 2000);
+  };
+
+  if (!script) return <div style={{padding:40,textAlign:"center",color:C.txD,fontSize:14}}>원고 데이터가 없습니다. 먼저 원고를 업로드하세요.</div>;
+
+  // Pre-generate form (before results)
+  if (!result && !loading) return <div style={{maxWidth:600,margin:"40px auto",padding:"0 24px"}}>
+    <div style={{background:C.sf,borderRadius:14,border:`1px solid ${C.bd}`,padding:24}}>
+      <div style={{fontSize:15,fontWeight:700,marginBottom:16}}>세트 생성</div>
+      <div style={{display:"flex",gap:12,marginBottom:16,alignItems:"flex-end"}}>
+        <div style={{width:140,flexShrink:0}}>
+          <label style={{fontSize:12,color:C.txD,fontWeight:600,display:"block",marginBottom:4}}>게스트 이름</label>
+          <input value={gN} onChange={e=>setGN(e.target.value)} placeholder="박종천"
+            style={{width:"100%",padding:"8px 12px",borderRadius:8,border:`1px solid ${C.bd}`,background:"rgba(0,0,0,0.03)",color:C.tx,fontSize:14,fontFamily:FN,outline:"none",boxSizing:"border-box"}}/>
         </div>
-        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 8 }}>
-          <input
-            type="text"
-            placeholder="게스트 이름 (예: 박종천)"
-            value={guestName}
-            onChange={(e) => setGuestName(e.target.value)}
-            disabled={running}
-            style={{ flex: 1, minWidth: 160, padding: "6px 10px", border: "1px solid #d1d5db", borderRadius: 4, fontSize: 13 }}
-          />
-          <input
-            type="text"
-            placeholder="게스트 직함 (예: 30년 차 개발자)"
-            value={guestTitle}
-            onChange={(e) => setGuestTitle(e.target.value)}
-            disabled={running}
-            style={{ flex: 1, minWidth: 160, padding: "6px 10px", border: "1px solid #d1d5db", borderRadius: 4, fontSize: 13 }}
-          />
+        <div style={{flex:1,minWidth:0}}>
+          <label style={{fontSize:12,color:C.txD,fontWeight:600,display:"block",marginBottom:4}}>직함/소속</label>
+          <input value={gT} onChange={e=>setGT(e.target.value)} placeholder="30년 개발자"
+            style={{width:"100%",padding:"8px 12px",borderRadius:8,border:`1px solid ${C.bd}`,background:"rgba(0,0,0,0.03)",color:C.tx,fontSize:14,fontFamily:FN,outline:"none",boxSizing:"border-box"}}/>
         </div>
-        <input
-          type="text"
-          placeholder="포커스 키워드 (선택 — 입력 시 'focus' type 후보 생성, 미입력 시 'script' type)"
-          value={focusKeyword}
-          onChange={(e) => setFocusKeyword(e.target.value)}
-          disabled={running}
-          style={{ width: "100%", padding: "6px 10px", border: "1px solid #d1d5db", borderRadius: 4, fontSize: 13, boxSizing: "border-box" }}
-        />
       </div>
-
-      {/* 상태 카드 */}
-      <div style={{ display: "flex", gap: 12, marginBottom: 16, flexWrap: "wrap" }}>
-        <div style={{ flex: 1, minWidth: 160, padding: 12, background: hasInput ? "#f0f4ff" : "#fee2e2", borderRadius: 6 }}>
-          <div style={{ fontSize: 11, fontWeight: 700, color: hasInput ? "#345" : "#991b1b", textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 4 }}>
-            📦 입력
-          </div>
-          <div style={{ fontSize: 14, fontWeight: 700, color: hasInput ? "#234" : "#dc2626" }}>
-            {correctionBlocks.length > 0 ? `1차 교정 ${correctionBlocks.length} 블록` : cleanText.length > 200 ? `${cleanText.length.toLocaleString()} 자` : "입력 부족"}
-          </div>
-        </div>
-        <div style={{ flex: 1, minWidth: 160, padding: 12, background: result ? "#ecfdf5" : "#fef3c7", borderRadius: 6 }}>
-          <div style={{ fontSize: 11, fontWeight: 700, color: result ? "#065f46" : "#78350f", textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 4 }}>
-            🎬 세트 후보
-          </div>
-          <div style={{ fontSize: 20, fontWeight: 700, color: result ? "#047857" : "#92400e" }}>
-            {result ? thumbnails.length : 0}
-          </div>
-          {result && (
-            <div style={{ fontSize: 11, color: "#059669", marginTop: 2 }}>
-              태그 {tags.length} · 제목 {titles.length}
-            </div>
-          )}
-        </div>
-        <div style={{ flex: 1, minWidth: 160, padding: 12, background: trendingNow.length > 0 ? "#ecfdf5" : "#fef3c7", borderRadius: 6 }}>
-          <div style={{ fontSize: 11, fontWeight: 700, color: trendingNow.length > 0 ? "#065f46" : "#78350f", textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 4 }}>
-            🔥 트렌드 (KR)
-          </div>
-          <div style={{ fontSize: 20, fontWeight: 700, color: trendingNow.length > 0 ? "#047857" : "#92400e" }}>
-            {trendingNow.length}
-          </div>
-        </div>
+      <div style={{fontSize:12,color:C.txM,marginBottom:16}}>원고 {(script||"").length.toLocaleString()}자</div>
+      <div style={{marginBottom:16}}>
+        <label style={{fontSize:12,color:"#EA580C",fontWeight:600,display:"block",marginBottom:4}}>집중 키워드 (선택)</label>
+        <input value={focusKw} onChange={e=>setFocusKw(e.target.value)} placeholder="예: 애플 중심으로 / 애플과 구글의 전쟁"
+          style={{width:"100%",padding:"8px 12px",borderRadius:8,border:"1px solid rgba(234,88,12,0.3)",background:"rgba(234,88,12,0.04)",color:C.tx,fontSize:14,fontFamily:FN,outline:"none",boxSizing:"border-box"}}/>
+        <div style={{fontSize:11,color:C.txD,marginTop:4}}>입력하면 3번째 후보가 이 키워드 중심으로 생성됩니다.</div>
+        {suggestedKeywords?.length > 0 && <div style={{marginTop:8,display:"flex",flexWrap:"wrap",gap:4}}>
+          {suggestedKeywords.map((kw, i) => <button key={i} onClick={()=>setFocusKw(kw)}
+            style={{fontSize:11,padding:"2px 8px",borderRadius:6,border:`1px solid rgba(234,88,12,0.2)`,background:"rgba(234,88,12,0.04)",color:"#EA580C",cursor:"pointer"}}>{kw}</button>)}
+        </div>}
       </div>
-
-      {/* 실행 버튼 */}
-      <div style={{ marginBottom: 16 }}>
-        <div style={{ display: "flex", justifyContent: "flex-end", alignItems: "center", gap: 12 }}>
-          {running && <span style={{ color: "#06f", fontSize: 13 }}>{progress}</span>}
-          <button
-            onClick={handleStartSetgen}
-            disabled={running || !hasInput}
-            style={{
-              padding: "8px 20px", borderRadius: 6, border: "none",
-              background: running || !hasInput ? "#bbb" : "linear-gradient(135deg, #ef4444, #8b5cf6)",
-              color: "#fff", fontSize: 13, fontWeight: 700,
-              cursor: running || !hasInput ? "not-allowed" : "pointer",
-            }}
-          >
-            {result ? "🎬 세트 재생성" : "🎬 세트 생성 (트렌드 + 3 GPT 병렬)"}
-          </button>
-        </div>
-        {error && (
-          <div style={{ marginTop: 8, padding: 10, background: "#fee2e2", borderRadius: 4, color: "#991b1b", fontSize: 13 }}>
-            ❌ {error}
-          </div>
-        )}
-      </div>
-
-      {!hasInput && (
-        <div style={{ padding: 16, background: "#f7f7f7", borderRadius: 4, color: "#666" }}>
-          1차 교정 완료된 본문 또는 0차 검토의 cleanText 가 필요합니다 (최소 200자).
-        </div>
-      )}
-
-      {/* 키워드 + 인상 발언 (추출 결과) */}
-      {keywordsExtracted.length > 0 && (
-        <div style={{ marginBottom: 16, padding: 12, background: "#f9fafb", borderRadius: 6 }}>
-          <div style={{ fontSize: 11, fontWeight: 700, color: "#666", textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 6 }}>
-            🔑 추출 키워드 ({keywordsExtracted.length})
-          </div>
-          <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
-            {keywordsExtracted.map((kw, i) => {
-              const tn = trendingNow.filter((t) => t.indexOf(kw) >= 0 || kw.indexOf(t) >= 0).length > 0;
-              const news = trendData[kw]?.news_24h || 0;
-              return (
-                <span key={i} style={{ padding: "3px 8px", background: tn ? "#fee2e2" : "#fff", border: "1px solid #d1d5db", borderRadius: 12, fontSize: 12 }}>
-                  {kw} {tn && "🔥"} {news > 0 && <span style={{ color: "#666", fontSize: 11 }}>📰{news}</span>}
-                </span>
-              );
-            })}
-          </div>
-        </div>
-      )}
-
-      {/* 3 후보 세트 표시 */}
-      {result && thumbnails.length > 0 && (
-        <div style={{ borderTop: "1px solid #eee", paddingTop: 12 }}>
-          <div style={{ fontSize: 11, fontWeight: 700, color: "#666", textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 8 }}>
-            3 후보 세트 (썸네일 / 제목 / 설명문)
-          </div>
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))", gap: 12 }}>
-            {thumbnails.map((th, i) => {
-              const ts = TYPE_STYLES[th.type] || TYPE_STYLES.balanced;
-              const title = titles[i];
-              const desc = descriptions[i];
-              return (
-                <div key={i} style={{ padding: 12, background: ts.bg, border: `2px solid ${ts.color}`, borderRadius: 6 }}>
-                  <div style={{ fontSize: 12, fontWeight: 700, color: ts.color, marginBottom: 8 }}>
-                    {ts.label}
-                  </div>
-
-                  {/* 썸네일 */}
-                  <div style={{ marginBottom: 10, padding: 8, background: "#fff", borderRadius: 4 }}>
-                    <div style={{ fontSize: 10, color: "#888", marginBottom: 4 }}>🖼️ 썸네일</div>
-                    {(th.lines || []).map((l, li) => (
-                      <div key={li} style={{ fontSize: 14, fontWeight: 700, color: "#222", lineHeight: 1.3 }}>{l}</div>
-                    ))}
-                    {th.reason && <div style={{ fontSize: 10, color: "#666", marginTop: 4, fontStyle: "italic" }}>{th.reason}</div>}
-                  </div>
-
-                  {/* 제목 */}
-                  {title && (
-                    <div style={{ marginBottom: 10, padding: 8, background: "#fff", borderRadius: 4 }}>
-                      <div style={{ fontSize: 10, color: "#888", marginBottom: 4 }}>📝 제목 ({(title.text || "").length}자)</div>
-                      <div style={{ fontSize: 13, fontWeight: 600, color: "#222" }}>{title.text}</div>
-                      {title.reason && <div style={{ fontSize: 10, color: "#666", marginTop: 4, fontStyle: "italic" }}>{title.reason}</div>}
-                    </div>
-                  )}
-
-                  {/* 설명문 */}
-                  {desc && (
-                    <div style={{ padding: 8, background: "#fff", borderRadius: 4 }}>
-                      <div style={{ fontSize: 10, color: "#888", marginBottom: 4 }}>📄 설명문</div>
-                      <div style={{ fontSize: 12, color: "#222", lineHeight: 1.5, whiteSpace: "pre-wrap" }}>{desc.text}</div>
-                    </div>
-                  )}
-                </div>
-              );
-            })}
-          </div>
-        </div>
-      )}
-
-      {/* 통합 태그 */}
-      {tags.length > 0 && (
-        <div style={{ marginTop: 16, padding: 12, background: "#f9fafb", borderRadius: 6 }}>
-          <div style={{ fontSize: 11, fontWeight: 700, color: "#666", textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 6 }}>
-            🏷️ 통합 태그 ({tags.length})
-          </div>
-          <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
-            {tags.map((t, i) => (
-              <span key={i} style={{ padding: "3px 8px", background: t.source === "both" ? "#fef3c7" : t.source === "trend" ? "#fee2e2" : "#dbeafe", border: "1px solid #d1d5db", borderRadius: 12, fontSize: 12 }}>
-                {t.tag}
-                <span style={{ marginLeft: 4, fontSize: 10, color: "#666" }}>· {t.source}</span>
-              </span>
-            ))}
-          </div>
-        </div>
-      )}
+      <button onClick={generate} style={{width:"100%",padding:"12px",borderRadius:10,border:"none",background:`linear-gradient(135deg,#5B4CD4,#7C3AED)`,color:"#fff",fontSize:15,fontWeight:700,cursor:"pointer"}}>
+        세트 생성 (키워드 → 트렌드 수집 → 3개 개별 생성)</button>
+      {err && <div style={{marginTop:12,padding:"10px 14px",borderRadius:8,background:"rgba(239,68,68,0.06)",color:"#DC2626",fontSize:13}}>{err}</div>}
     </div>
-  );
+  </div>;
+
+  // Loading state
+  if (loading) return <div style={{textAlign:"center",padding:"80px 24px"}}>
+    <div style={{fontSize:40,marginBottom:16,animation:"spin 1.5s linear infinite"}}>*</div>
+    <div style={{fontSize:15,fontWeight:600,color:C.tx,marginBottom:8}}>{loadMsg}</div>
+    <div style={{fontSize:12,color:C.txD}}>총 4회 GPT 호출 (30~50초 소요)</div>
+    <div style={{maxWidth:300,margin:"20px auto",height:4,background:C.bd,borderRadius:2,overflow:"hidden"}}>
+      <div style={{height:"100%",background:"#5B4CD4",borderRadius:2,animation:"progress 40s linear",width:"0%"}}/>
+    </div>
+    <style>{"@keyframes spin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}@keyframes progress{from{width:0%}to{width:95%}}"}</style>
+  </div>;
+
+  // Results view
+  return <div style={{maxWidth:860,margin:"20px auto",padding:"0 20px 60px",overflowY:"auto",maxHeight:"calc(100vh - 90px)"}}>
+    {/* Header actions */}
+    <div style={{display:"flex",justifyContent:"flex-end",gap:8,marginBottom:14}}>
+      <button onClick={timestamps ? ()=>setShowTimestamps(!showTimestamps) : generateTimestamps} disabled={tsLoading}
+        style={{fontSize:12,padding:"5px 14px",borderRadius:6,border:"1px solid #8B5CF6",background:tsLoading?"#999":timestamps&&showTimestamps?"#8B5CF6":"rgba(139,92,246,0.08)",color:tsLoading?"#fff":timestamps&&showTimestamps?"#fff":"#8B5CF6",fontWeight:600,cursor:"pointer"}}>
+        {tsLoading ? "생성 중..." : timestamps ? (showTimestamps ? "타임스탬프 ▲" : "타임스탬프 ▼") : "타임스탬프"}</button>
+      <button onClick={copyAll} style={{fontSize:12,padding:"5px 14px",borderRadius:6,border:"none",background:copied?"#16A34A":"#5B4CD4",color:"#fff",fontWeight:600,cursor:"pointer"}}>
+        {copied ? "복사 완료" : "전체 복사"}</button>
+      <button onClick={()=>{setResult(null);setTrendData(null);setTrendingNow([]);setKeywords([]);setSel({});setEdits({});setTimestamps(null);}}
+        style={{fontSize:12,padding:"5px 14px",borderRadius:6,border:`1px solid ${C.bd}`,background:C.sf,color:C.txM,cursor:"pointer"}}>다시 생성</button>
+    </div>
+
+    {/* Timestamp Section */}
+    {timestamps && showTimestamps && <div style={{marginBottom:14,borderRadius:14,border:"1px solid rgba(139,92,246,0.3)",background:"rgba(139,92,246,0.04)",overflow:"hidden"}}>
+      <div style={{padding:"12px 18px",display:"flex",alignItems:"center",justifyContent:"space-between",borderBottom:"1px solid rgba(139,92,246,0.15)"}}>
+        <div style={{fontSize:14,fontWeight:700,color:"#8B5CF6"}}>타임스탬프 ({timestamps.length}개)</div>
+        <div style={{display:"flex",gap:6}}>
+          <button onClick={generateTimestamps} disabled={tsLoading} style={{fontSize:11,padding:"3px 10px",borderRadius:5,border:"1px solid rgba(139,92,246,0.3)",background:"transparent",color:"#8B5CF6",cursor:"pointer",fontWeight:600}}>
+            {tsLoading ? "생성 중..." : "재생성"}</button>
+          <button onClick={copyTimestamps} style={{fontSize:11,padding:"3px 10px",borderRadius:5,border:"1px solid rgba(139,92,246,0.3)",background:tsCopied?"#8B5CF6":"transparent",color:tsCopied?"#fff":"#8B5CF6",cursor:"pointer",fontWeight:600}}>
+            {tsCopied ? "복사됨" : "복사"}</button>
+        </div>
+      </div>
+      <div style={{padding:"10px 18px 14px"}}>
+        {timestamps.map((t, i) => <div key={i} style={{padding:"6px 0",borderBottom:i<timestamps.length-1?"1px solid rgba(139,92,246,0.08)":"none",display:"flex",gap:10,alignItems:"flex-start"}}>
+          <span style={{fontSize:13,fontWeight:700,color:"#8B5CF6",flexShrink:0,fontVariantNumeric:"tabular-nums",minWidth:36}}>{t.time}</span>
+          <div>
+            <div style={{fontSize:13,fontWeight:600,color:C.tx,lineHeight:1.5}}>{t.title}</div>
+            {t.summary && <div style={{fontSize:11,color:C.txD,marginTop:2,lineHeight:1.4}}>{t.summary}</div>}
+          </div>
+        </div>)}
+        <div style={{marginTop:10,padding:"8px 10px",borderRadius:6,background:"rgba(139,92,246,0.06)",fontSize:11,color:C.txD,lineHeight:1.5}}>
+          예상 영상 길이: <strong style={{color:"#8B5CF6"}}>{Math.floor(predictMinutes(scriptBlocks.reduce((s,b)=>s+(b.text||"").length,0)))}분 {Math.round((predictMinutes(scriptBlocks.reduce((s,b)=>s+(b.text||"").length,0)) % 1) * 60)}초</strong>
+        </div>
+      </div>
+    </div>}
+
+    {/* Tags */}
+    {result.tags?.length > 0 && <div style={{background:C.sf,borderRadius:14,border:`1px solid ${C.bd}`,padding:"18px 22px",marginBottom:14}}>
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:12}}>
+        <span style={{fontSize:14,fontWeight:700}}>추천 태그 ({result.tags.length}개)</span>
+        <button onClick={()=>navigator.clipboard.writeText(result.tags.map(t=>t.tag).join(", "))}
+          style={{fontSize:11,padding:"3px 10px",borderRadius:5,border:`1px solid ${C.bd}`,background:C.sf,color:C.txM,cursor:"pointer"}}>태그 복사</button>
+      </div>
+      <div style={{display:"flex",flexWrap:"wrap",gap:6,marginBottom:12}}>
+        {result.tags.map((t, i) => { const sb = SRC_BADGE[t.source] || SRC_BADGE.script;
+          return <div key={i} style={{display:"inline-flex",alignItems:"center",gap:4,padding:"4px 10px",borderRadius:8,background:sb.bg,border:`1px solid ${sb.bd}`,fontSize:12,cursor:"default"}} title={t.reason}>
+            <span style={{fontWeight:600,color:sb.tx}}>{t.tag}</span>
+            <span style={{fontSize:9,color:sb.tx,opacity:0.7}}>{sb.label}</span>
+          </div>; })}
+      </div>
+      <details><summary style={{fontSize:11,color:C.txD,cursor:"pointer"}}>태그별 추천 근거</summary>
+        <div style={{marginTop:8,fontSize:12,color:C.txM,lineHeight:1.8}}>
+          {result.tags.map((t, i) => <div key={i} style={{marginBottom:4}}><span style={{fontWeight:600,color:C.tx}}>{t.tag}</span> — {t.reason}</div>)}
+        </div>
+      </details>
+    </div>}
+
+    {/* Trend Data */}
+    {(trendData || trendingNow.length > 0) && <div style={{marginBottom:14}}>
+      <button onClick={()=>setShowTrend(!showTrend)} style={{fontSize:12,color:"#2563EB",background:"rgba(59,130,246,0.06)",border:"1px solid rgba(59,130,246,0.15)",padding:"6px 14px",borderRadius:8,cursor:"pointer",fontWeight:600}}>
+        {showTrend ? "트렌드 접기" : "수집된 트렌드 데이터 보기"}</button>
+      {showTrend && <div style={{background:C.sf,borderRadius:12,border:`1px solid ${C.bd}`,padding:16,marginTop:8,maxHeight:500,overflowY:"auto"}}>
+        {trendingNow.length > 0 && <div style={{marginBottom:16}}>
+          <div style={{fontSize:13,fontWeight:700,color:"#DC2626",marginBottom:8}}>Google Trends 급상승</div>
+          <div style={{display:"flex",flexWrap:"wrap",gap:6}}>
+            {trendingNow.map((t, i) => <span key={i} style={{fontSize:11,padding:"3px 8px",borderRadius:6,background:"rgba(239,68,68,0.06)",border:"1px solid rgba(239,68,68,0.15)",color:"#DC2626"}}>{t}</span>)}
+          </div>
+        </div>}
+        {trendData && Object.entries(trendData).map(([kw, d]) => <div key={kw} style={{marginBottom:14}}>
+          <div style={{fontSize:13,fontWeight:700,color:C.tx,marginBottom:4}}>
+            "{kw}" <span style={{fontSize:11,fontWeight:400,color:d.news_24h>5?"#DC2626":C.txD}}>뉴스 {d.news_24h}건/24h</span>
+          </div>
+          <div style={{display:"flex",gap:16,flexWrap:"wrap"}}>
+            {d.youtube?.length > 0 && <div style={{flex:1,minWidth:200}}>
+              <div style={{fontSize:10,fontWeight:700,color:"#2563EB",marginBottom:4}}>YouTube</div>
+              {d.youtube.map((s, i) => <div key={i} style={{fontSize:12,color:C.txM,padding:"1px 0"}}>{i+1}. {s}</div>)}
+            </div>}
+            {d.google?.length > 0 && <div style={{flex:1,minWidth:200}}>
+              <div style={{fontSize:10,fontWeight:700,color:"#16A34A",marginBottom:4}}>Google</div>
+              {d.google.map((s, i) => <div key={i} style={{fontSize:12,color:C.txM,padding:"1px 0"}}>{i+1}. {s}</div>)}
+            </div>}
+          </div>
+        </div>)}
+      </div>}
+    </div>}
+
+    {/* Set Fields */}
+    {FIELDS.map(key => {
+      const cands = result[key] || []; if (cands.length === 0) return null;
+      const si = sel[key] ?? 0;
+      const item = cands[si];
+      return <div key={key} style={{background:C.sf,borderRadius:14,border:`1px solid ${C.bd}`,padding:"20px 22px",marginBottom:14}}>
+        <div style={{fontSize:15,fontWeight:700,marginBottom:14}}>{FLABELS[key]}</div>
+        <div style={{display:"flex",gap:8,marginBottom:12}}>
+          {cands.map((c, ci) => { const tc = TYPE_COLORS[c.type] || TYPE_COLORS.balanced; const isSel = si === ci;
+            return <button key={ci} onClick={() => setSel(p => ({...p, [key]: ci}))}
+              style={{fontSize:12,fontWeight:600,padding:"5px 14px",borderRadius:8,cursor:"pointer",
+                border:`1px solid ${isSel ? tc.bd : "transparent"}`,background:isSel ? tc.bg : "rgba(0,0,0,0.04)",color:isSel ? tc.tx : C.txD}}>
+              {TYPE_LABELS[c.type] || c.type}</button>; })}
+        </div>
+        <textarea value={edits[key + "-" + si] !== undefined ? edits[key + "-" + si] : getDisplay(key, si)}
+          onChange={e => setEdits(p => ({...p, [key + "-" + si]: e.target.value}))}
+          rows={key === "description" ? 6 : key === "thumbnail" ? 3 : 2}
+          style={{width:"100%",padding:"10px 12px",borderRadius:8,border:`1px solid ${C.bd}`,background:"rgba(0,0,0,0.03)",color:C.tx,fontSize:14,fontFamily:FN,lineHeight:1.7,resize:"vertical",outline:"none",boxSizing:"border-box"}}/>
+        {item?.reason && <div style={{marginTop:8,padding:"8px 12px",borderRadius:8,background:"rgba(0,0,0,0.02)",fontSize:12,color:C.txD,lineHeight:1.6}}>
+          <span style={{fontWeight:600}}>근거:</span> {item.reason}</div>}
+        <div style={{display:"flex",justifyContent:"flex-end",marginTop:6}}>
+          <button onClick={() => navigator.clipboard.writeText(getSelected(key))}
+            style={{fontSize:11,padding:"3px 10px",borderRadius:5,border:`1px solid ${C.bd}`,background:C.sf,color:C.txM,cursor:"pointer"}}>복사</button>
+        </div>
+      </div>; })}
+  </div>;
 }

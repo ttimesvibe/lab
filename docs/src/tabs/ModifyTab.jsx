@@ -1,275 +1,633 @@
-// lab fresh v2 — ModifyTab (★ 실 UI Phase 9 — 수정 카드 + YouTube 임베딩)
-// 사료: S2.4.2.f 수정사항 + S4a.4 모범 5건 (TAB-MOD-01~03)
-//
-// 책임:
-//   - YouTube URL 입력 → 자동 videoId 추출 → 임베드
-//   - 수정 카드 추가/편집/삭제 (timestamp + note + status)
-//   - LLM 호출 X (편집자 메모용)
+import { useState, useEffect, useRef, useCallback, useMemo } from "react";
+import { C, FN } from "../utils/styles.js";
 
-import { useState } from "react";
-
-const STATUS_STYLES = {
-  pending:    { color: "#d97706", bg: "#fef3c7", label: "⏳ 대기" },
-  done:       { color: "#16a34a", bg: "#d1fae5", label: "✅ 완료" },
-  in_progress: { color: "#3b82f6", bg: "#dbeafe", label: "🔄 진행 중" },
+// ═══════════════════════════════════════
+// CONFIG & CONSTANTS
+// ═══════════════════════════════════════
+const CATEGORIES = [
+  { value: "subtitle", label: "자막", icon: "💬" },
+  { value: "cut", label: "구간 삭제", icon: "✂️" },
+  { value: "graphic", label: "그래픽", icon: "🎨" },
+  { value: "audio", label: "오디오", icon: "🔊" },
+  { value: "etc", label: "기타", icon: "📌" },
+];
+const CAT_COLORS = {
+  subtitle: { color: "#F87171", bg: "rgba(248,113,113,0.1)" },
+  cut:      { color: "#FBBF24", bg: "rgba(251,191,36,0.1)" },
+  graphic:  { color: "#A78BFA", bg: "rgba(167,139,250,0.1)" },
+  audio:    { color: "#34D399", bg: "rgba(52,211,153,0.1)" },
+  etc:      { color: "#6C9CFC", bg: "rgba(108,156,252,0.1)" },
 };
 
-/**
- * YouTube URL → videoId 추출.
- *   https://www.youtube.com/watch?v=ABC123  → "ABC123"
- *   https://youtu.be/ABC123                  → "ABC123"
- *   https://www.youtube.com/embed/ABC123     → "ABC123"
- */
-function extractYouTubeId(url) {
-  if (!url || typeof url !== "string") return "";
-  const patterns = [
-    /youtube\.com\/watch\?v=([a-zA-Z0-9_-]{11})/,
-    /youtu\.be\/([a-zA-Z0-9_-]{11})/,
-    /youtube\.com\/embed\/([a-zA-Z0-9_-]{11})/,
-  ];
-  for (const re of patterns) {
-    const m = url.match(re);
-    if (m) return m[1];
+// 편집자 식별 색상 (등장 순서 기준)
+const EDITOR_COLORS = [
+  "#F87171", // 1번째 편집자: 빨강
+  "#60A5FA", // 2번째 편집자: 파랑
+  "#34D399", // 3번째 편집자: 초록
+];
+const EDITOR_COLOR_DEFAULT = "#9CA3AF"; // 4명+ 또는 작성자 정보 없음: 회색
+
+// 카드 목록에서 편집자 → 색상 맵 생성 (createdAt 오름차순 등장 순서)
+function buildEditorColorMap(cards) {
+  const map = {}; // email → color
+  let idx = 0;
+  const sortedCards = [...cards].sort((a, b) => {
+    const aT = a.createdAt || "";
+    const bT = b.createdAt || "";
+    return aT < bT ? -1 : aT > bT ? 1 : 0;
+  });
+  for (const c of sortedCards) {
+    const email = c.createdBy?.email;
+    if (!email || map[email]) continue;
+    map[email] = idx < EDITOR_COLORS.length ? EDITOR_COLORS[idx] : EDITOR_COLOR_DEFAULT;
+    idx++;
   }
-  return "";
+  return map;
 }
 
-export function ModifyTab({ tabId, data, allTabData, onSave, onMultiSave, sessionId, config, currentTab, authUser }) {
-  const cards = data?.cards || [];
-  const videoUrl = data?.videoUrl || "";
-  const videoId = data?.videoId || extractYouTubeId(videoUrl);
-  const title = data?.title || allTabData?.meta?.fn || "";
+// ═══════════════════════════════════════
+// HELPERS
+// ═══════════════════════════════════════
+function genId() { return Math.random().toString(36).slice(2, 10); }
 
-  const [urlInput, setUrlInput] = useState(videoUrl);
-  const [newCardTs, setNewCardTs] = useState("");
-  const [newCardNote, setNewCardNote] = useState("");
-  const [editingId, setEditingId] = useState(null);
-  const [editNote, setEditNote] = useState("");
+function fmtTime(sec) {
+  if (sec == null) return "--:--";
+  const s = Math.floor(sec);
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const ss = s % 60;
+  if (h > 0) return `${h}:${String(m).padStart(2,"0")}:${String(ss).padStart(2,"0")}`;
+  return `${m}:${String(ss).padStart(2,"0")}`;
+}
 
-  function handleSaveVideoUrl() {
-    const id = extractYouTubeId(urlInput.trim());
-    onSave({ ...data, videoUrl: urlInput.trim(), videoId: id });
-  }
+function parseYouTubeId(url) {
+  if (!url) return null;
+  const m = url.match(/(?:youtu\.be\/|v=|\/embed\/|\/v\/|\/shorts\/)([A-Za-z0-9_-]{11})/);
+  return m ? m[1] : null;
+}
 
-  function handleAddCard() {
-    if (!newCardNote.trim()) return;
-    const newCard = {
-      _stableId: `card_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
-      timestamp: newCardTs.trim(),
-      note: newCardNote.trim(),
-      status: "pending",
-      createdAt: new Date().toISOString(),
+async function resizeImage(blob, maxW = 640, quality = 0.7) {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => {
+      const ratio = Math.min(maxW / img.width, 1);
+      const w = Math.round(img.width * ratio);
+      const h = Math.round(img.height * ratio);
+      const canvas = document.createElement("canvas");
+      canvas.width = w; canvas.height = h;
+      const ctx = canvas.getContext("2d");
+      ctx.drawImage(img, 0, 0, w, h);
+      canvas.toBlob((b) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result.split(",")[1]);
+        reader.readAsDataURL(b);
+      }, "image/jpeg", quality);
     };
-    onSave({ ...data, cards: [...cards, newCard] });
-    setNewCardTs("");
-    setNewCardNote("");
-  }
+    img.src = URL.createObjectURL(blob);
+  });
+}
 
-  function handleStatusChange(id, newStatus) {
-    const newCards = cards.map((c) => (c._stableId === id ? { ...c, status: newStatus, updatedAt: new Date().toISOString() } : c));
-    onSave({ ...data, cards: newCards });
-  }
+// ═══════════════════════════════════════
+// YouTubePlayer
+// ═══════════════════════════════════════
+function YouTubePlayer({ videoId, onPlayerReady }) {
+  const containerRef = useRef(null);
+  const playerRef = useRef(null);
 
-  function handleEditStart(card) {
-    setEditingId(card._stableId);
-    setEditNote(card.note || "");
-  }
+  useEffect(() => {
+    if (!videoId) return;
+    const initPlayer = () => {
+      if (playerRef.current) { try { playerRef.current.destroy(); } catch {} }
+      // CMS v2 — origin 명시 → "Failed to execute 'postMessage'" SDK 에러 제거
+      playerRef.current = new window.YT.Player(containerRef.current, {
+        videoId,
+        playerVars: { rel: 0, modestbranding: 1, origin: window.location.origin },
+        host: "https://www.youtube-nocookie.com",
+        events: { onReady: () => onPlayerReady(playerRef.current) },
+      });
+    };
+    if (window.YT && window.YT.Player) {
+      initPlayer();
+    } else {
+      if (!document.querySelector('script[src*="youtube.com/iframe_api"]')) {
+        const tag = document.createElement("script");
+        tag.src = "https://www.youtube.com/iframe_api";
+        document.head.appendChild(tag);
+      }
+      const prev = window.onYouTubeIframeAPIReady;
+      window.onYouTubeIframeAPIReady = () => { if (prev) prev(); initPlayer(); };
+    }
+    return () => { if (playerRef.current) try { playerRef.current.destroy(); } catch {} };
+  }, [videoId]);
 
-  function handleEditSave(id) {
-    const newCards = cards.map((c) => (c._stableId === id ? { ...c, note: editNote.trim(), updatedAt: new Date().toISOString() } : c));
-    onSave({ ...data, cards: newCards });
-    setEditingId(null);
-    setEditNote("");
-  }
+  return (
+    <div style={{ position: "relative", paddingTop: "56.25%", background: "#000", borderRadius: 12, overflow: "hidden", border: `1px solid ${C.bd}` }}>
+      <div ref={containerRef} style={{ position: "absolute", top: 0, left: 0, width: "100%", height: "100%" }} />
+    </div>
+  );
+}
 
-  function handleDelete(id) {
-    if (!confirm("이 카드를 삭제하시겠습니까?")) return;
-    const newCards = cards.filter((c) => c._stableId !== id);
-    onSave({ ...data, cards: newCards });
-  }
+// ═══════════════════════════════════════
+// CardForm
+// ═══════════════════════════════════════
+function CardForm({ onSubmit, currentTime, onCancel }) {
+  const [content, setContent] = useState("");
+  const [category, setCategory] = useState("subtitle");
+  const [imageData, setImageData] = useState(null);
+  const [imagePreview, setImagePreview] = useState(null);
+  const [tsStart, setTsStart] = useState(currentTime ?? 0);
+  const [tsEnd, setTsEnd] = useState("");
+  const textRef = useRef(null);
 
-  // 상태별 카운트
-  const counts = {
-    pending: cards.filter((c) => c.status === "pending").length,
-    in_progress: cards.filter((c) => c.status === "in_progress").length,
-    done: cards.filter((c) => c.status === "done").length,
+  useEffect(() => { textRef.current?.focus(); }, []);
+
+  // Ctrl+V 이미지 붙여넣기
+  useEffect(() => {
+    const handler = async (e) => {
+      const items = e.clipboardData?.items;
+      if (!items) return;
+      for (const item of items) {
+        if (item.type.startsWith("image/")) {
+          e.preventDefault();
+          const blob = item.getAsFile();
+          const b64 = await resizeImage(blob);
+          setImageData(b64);
+          setImagePreview(`data:image/jpeg;base64,${b64}`);
+          break;
+        }
+      }
+    };
+    document.addEventListener("paste", handler);
+    return () => document.removeEventListener("paste", handler);
+  }, []);
+
+  const handleSubmit = () => {
+    if (!content.trim()) return;
+    onSubmit({
+      id: genId(),
+      timestamp: tsStart,
+      timestampEnd: tsEnd !== "" ? parseFloat(tsEnd) : null,
+      content: content.trim(),
+      category,
+      hasImage: !!imageData,
+      imageData: imageData || null,
+      checked: false,
+      reply: "",
+      createdAt: new Date().toISOString(),
+    });
+    setContent(""); setCategory("subtitle"); setImageData(null); setImagePreview(null);
+    setTsStart(currentTime ?? 0); setTsEnd("");
   };
 
   return (
-    <div className="tab tab-modify">
-      <h2 style={{ margin: "0 0 12px 0" }}>수정사항 (Modify)</h2>
-
-      {/* 영상 URL 입력 + 임베드 */}
-      <div style={{ marginBottom: 16, padding: 12, background: "#f9fafb", borderRadius: 6 }}>
-        <div style={{ fontSize: 11, fontWeight: 700, color: "#666", textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 6 }}>
-          📹 영상 (YouTube URL)
+    <div style={{ background: C.sf, border: `1px solid ${C.ac}`, borderRadius: 12, padding: 20, marginBottom: 16, boxShadow: `0 0 20px ${C.acS}` }}>
+      {/* 타임스탬프 */}
+      <div style={{ display: "flex", gap: 10, marginBottom: 14, alignItems: "center", flexWrap: "wrap" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+          <span style={{ color: C.txD, fontSize: 12 }}>시작</span>
+          <button onClick={() => setTsStart(currentTime)} title="현재 재생 시점으로 설정"
+            style={{ background: "rgba(255,255,255,0.04)", border: `1px solid ${C.bd}`, borderRadius: 6, color: C.ac, fontFamily: "monospace", fontSize: 14, padding: "4px 10px", cursor: "pointer", minWidth: 72, textAlign: "center" }}>
+            {fmtTime(tsStart)}</button>
         </div>
-        <div style={{ display: "flex", gap: 8 }}>
-          <input
-            type="text"
-            placeholder="https://www.youtube.com/watch?v=... 또는 https://youtu.be/..."
-            value={urlInput}
-            onChange={(e) => setUrlInput(e.target.value)}
-            style={{ flex: 1, padding: "6px 10px", border: "1px solid #d1d5db", borderRadius: 4, fontSize: 13 }}
-          />
-          <button
-            onClick={handleSaveVideoUrl}
-            disabled={!urlInput.trim() || urlInput.trim() === videoUrl}
-            style={{
-              padding: "6px 14px", borderRadius: 4, border: "none",
-              background: !urlInput.trim() || urlInput.trim() === videoUrl ? "#bbb" : "#3b82f6",
-              color: "#fff", fontSize: 13, fontWeight: 600,
-              cursor: !urlInput.trim() || urlInput.trim() === videoUrl ? "not-allowed" : "pointer",
-            }}
-          >
-            저장
-          </button>
-        </div>
-        {videoId && (
-          <div style={{ marginTop: 10 }}>
-            <div style={{ fontSize: 11, color: "#666", marginBottom: 4 }}>
-              videoId: <code style={{ background: "#fff", padding: "1px 4px", borderRadius: 2 }}>{videoId}</code>
-            </div>
-            <div style={{ position: "relative", paddingBottom: "56.25%", height: 0, overflow: "hidden", borderRadius: 4 }}>
-              <iframe
-                src={`https://www.youtube.com/embed/${videoId}`}
-                title="YouTube preview"
-                frameBorder="0"
-                allow="accelerometer; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
-                allowFullScreen
-                style={{ position: "absolute", top: 0, left: 0, width: "100%", height: "100%" }}
-              />
-            </div>
-          </div>
-        )}
-      </div>
-
-      {/* 상태 카드 */}
-      <div style={{ display: "flex", gap: 12, marginBottom: 16, flexWrap: "wrap" }}>
-        <div style={{ flex: 1, minWidth: 120, padding: 10, background: "#fef3c7", borderRadius: 6 }}>
-          <div style={{ fontSize: 10, fontWeight: 700, color: "#78350f", marginBottom: 4 }}>⏳ 대기</div>
-          <div style={{ fontSize: 22, fontWeight: 700, color: "#92400e" }}>{counts.pending}</div>
-        </div>
-        <div style={{ flex: 1, minWidth: 120, padding: 10, background: "#dbeafe", borderRadius: 6 }}>
-          <div style={{ fontSize: 10, fontWeight: 700, color: "#1e3a8a", marginBottom: 4 }}>🔄 진행 중</div>
-          <div style={{ fontSize: 22, fontWeight: 700, color: "#1d4ed8" }}>{counts.in_progress}</div>
-        </div>
-        <div style={{ flex: 1, minWidth: 120, padding: 10, background: "#d1fae5", borderRadius: 6 }}>
-          <div style={{ fontSize: 10, fontWeight: 700, color: "#065f46", marginBottom: 4 }}>✅ 완료</div>
-          <div style={{ fontSize: 22, fontWeight: 700, color: "#047857" }}>{counts.done}</div>
-        </div>
-        <div style={{ flex: 1, minWidth: 120, padding: 10, background: "#f3f4f6", borderRadius: 6 }}>
-          <div style={{ fontSize: 10, fontWeight: 700, color: "#374151", marginBottom: 4 }}>📋 전체</div>
-          <div style={{ fontSize: 22, fontWeight: 700, color: "#1f2937" }}>{cards.length}</div>
+        <span style={{ color: C.txD }}>~</span>
+        <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+          <span style={{ color: C.txD, fontSize: 12 }}>끝</span>
+          <button onClick={() => setTsEnd(String(currentTime))} title="현재 재생 시점으로 설정"
+            style={{ background: "rgba(255,255,255,0.04)", border: `1px solid ${tsEnd !== "" ? C.ac : C.bd}`, borderRadius: 6, color: tsEnd !== "" ? C.ac : C.txD, fontFamily: "monospace", fontSize: 14, padding: "4px 10px", cursor: "pointer", minWidth: 72, textAlign: "center" }}>
+            {tsEnd !== "" ? fmtTime(parseFloat(tsEnd)) : "클릭"}</button>
+          {tsEnd !== "" && <button onClick={() => setTsEnd("")} style={{ background: "transparent", border: "none", color: C.txD, cursor: "pointer", fontSize: 11, padding: "2px 4px" }}>✕</button>}
         </div>
       </div>
 
-      {/* 카드 추가 폼 */}
-      <div style={{ marginBottom: 16, padding: 12, background: "#f0f9ff", borderRadius: 6, border: "1px dashed #93c5fd" }}>
-        <div style={{ fontSize: 11, fontWeight: 700, color: "#0369a1", textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 6 }}>
-          ➕ 새 수정사항 추가
-        </div>
-        <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
-          <input
-            type="text"
-            placeholder="타임스탬프 (선택, 예: 1:23:45)"
-            value={newCardTs}
-            onChange={(e) => setNewCardTs(e.target.value)}
-            style={{ width: 200, padding: "6px 10px", border: "1px solid #d1d5db", borderRadius: 4, fontSize: 13 }}
-          />
-          <input
-            type="text"
-            placeholder="수정 내용 (필수)"
-            value={newCardNote}
-            onChange={(e) => setNewCardNote(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter") handleAddCard();
-            }}
-            style={{ flex: 1, padding: "6px 10px", border: "1px solid #d1d5db", borderRadius: 4, fontSize: 13 }}
-          />
-          <button
-            onClick={handleAddCard}
-            disabled={!newCardNote.trim()}
-            style={{
-              padding: "6px 16px", borderRadius: 4, border: "none",
-              background: !newCardNote.trim() ? "#bbb" : "#0ea5e9",
-              color: "#fff", fontSize: 13, fontWeight: 700,
-              cursor: !newCardNote.trim() ? "not-allowed" : "pointer",
-            }}
-          >
-            추가
-          </button>
-        </div>
-        <div style={{ fontSize: 11, color: "#666" }}>
-          ★ Enter 키로도 추가 가능
-        </div>
+      {/* 카테고리 */}
+      <div style={{ display: "flex", gap: 8, marginBottom: 14, flexWrap: "wrap" }}>
+        {CATEGORIES.map(c => (
+          <button key={c.value} onClick={() => setCategory(c.value)}
+            style={{ background: category === c.value ? C.acS : "rgba(255,255,255,0.04)", border: `1px solid ${category === c.value ? C.ac : C.bd}`, borderRadius: 6, padding: "4px 10px", cursor: "pointer", color: category === c.value ? C.ac : C.txD, fontSize: 13, fontFamily: FN, transition: "all 0.15s" }}>
+            {c.icon} {c.label}</button>
+        ))}
       </div>
 
-      {/* 카드 목록 */}
-      {cards.length === 0 ? (
-        <div style={{ padding: 16, background: "#f7f7f7", borderRadius: 4, color: "#666" }}>
-          수정사항 없음. 위 폼으로 새 카드를 추가하세요.
+      {/* 이미지 프리뷰 */}
+      {imagePreview ? (
+        <div style={{ marginBottom: 14, position: "relative", display: "inline-block" }}>
+          <img src={imagePreview} alt="캡처" style={{ maxWidth: "100%", maxHeight: 200, borderRadius: 8, border: `1px solid ${C.bd}` }} />
+          <button onClick={() => { setImageData(null); setImagePreview(null); }}
+            style={{ position: "absolute", top: -8, right: -8, background: C.err, color: "#fff", border: "none", borderRadius: "50%", width: 22, height: 22, cursor: "pointer", fontSize: 12, lineHeight: "22px" }}>✕</button>
         </div>
       ) : (
-        <div style={{ borderTop: "1px solid #eee", paddingTop: 12 }}>
-          <div style={{ fontSize: 11, fontWeight: 700, color: "#666", textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 8 }}>
-            수정 카드 ({cards.length})
-          </div>
-          <div style={{ maxHeight: "55vh", overflowY: "auto" }}>
-            {cards.map((c) => {
-              const ss = STATUS_STYLES[c.status] || STATUS_STYLES.pending;
-              const isEditing = editingId === c._stableId;
-              return (
-                <div key={c._stableId} style={{ padding: 10, marginBottom: 6, background: "#fff", border: `1px solid ${ss.color}`, borderLeft: `4px solid ${ss.color}`, borderRadius: 4 }}>
-                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
-                    <span style={{ fontSize: 11, color: "#666" }}>
-                      {c.timestamp && <code style={{ background: "#f3f4f6", padding: "1px 4px", borderRadius: 2, marginRight: 6 }}>{c.timestamp}</code>}
-                      <span style={{ color: "#999" }}>{c.createdAt ? new Date(c.createdAt).toLocaleString("ko-KR") : ""}</span>
-                    </span>
-                    <select
-                      value={c.status || "pending"}
-                      onChange={(e) => handleStatusChange(c._stableId, e.target.value)}
-                      style={{ padding: "2px 6px", border: `1px solid ${ss.color}`, color: ss.color, background: ss.bg, borderRadius: 3, fontSize: 11, fontWeight: 600 }}
-                    >
-                      <option value="pending">⏳ 대기</option>
-                      <option value="in_progress">🔄 진행 중</option>
-                      <option value="done">✅ 완료</option>
-                    </select>
-                  </div>
+        <div style={{ border: `1px dashed ${C.bd}`, borderRadius: 8, padding: "12px 16px", marginBottom: 14, color: C.txD, fontSize: 13, textAlign: "center", fontFamily: FN }}>
+          📋 Ctrl+V로 캡처 이미지 붙여넣기</div>
+      )}
 
-                  {isEditing ? (
-                    <div style={{ display: "flex", gap: 4 }}>
-                      <input
-                        type="text"
-                        value={editNote}
-                        onChange={(e) => setEditNote(e.target.value)}
-                        onKeyDown={(e) => {
-                          if (e.key === "Enter") handleEditSave(c._stableId);
-                          if (e.key === "Escape") { setEditingId(null); setEditNote(""); }
-                        }}
-                        autoFocus
-                        style={{ flex: 1, padding: "4px 8px", border: "1px solid #3b82f6", borderRadius: 3, fontSize: 13 }}
-                      />
-                      <button onClick={() => handleEditSave(c._stableId)} style={{ padding: "4px 10px", border: "none", background: "#3b82f6", color: "#fff", borderRadius: 3, cursor: "pointer", fontSize: 12 }}>저장</button>
-                      <button onClick={() => { setEditingId(null); setEditNote(""); }} style={{ padding: "4px 10px", border: "1px solid #ccc", background: "#fff", borderRadius: 3, cursor: "pointer", fontSize: 12 }}>취소</button>
-                    </div>
-                  ) : (
-                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 8 }}>
-                      <div style={{ flex: 1, fontSize: 14, color: "#222", lineHeight: 1.5, wordBreak: "keep-all" }}>
-                        {c.note}
-                      </div>
-                      <div style={{ display: "flex", gap: 4, flexShrink: 0 }}>
-                        <button onClick={() => handleEditStart(c)} style={{ padding: "3px 8px", border: "1px solid #ccc", background: "#fff", borderRadius: 3, cursor: "pointer", fontSize: 11 }}>편집</button>
-                        <button onClick={() => handleDelete(c._stableId)} style={{ padding: "3px 8px", border: "1px solid #ef4444", color: "#ef4444", background: "#fff", borderRadius: 3, cursor: "pointer", fontSize: 11 }}>삭제</button>
-                      </div>
-                    </div>
-                  )}
-                </div>
-              );
+      {/* 수정 내용 */}
+      <textarea ref={textRef} value={content} onChange={e => setContent(e.target.value)}
+        placeholder="수정 내용을 입력하세요..."
+        onKeyDown={e => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) handleSubmit(); }}
+        style={{ width: "100%", minHeight: 80, background: "rgba(255,255,255,0.04)", border: `1px solid ${C.bd}`, borderRadius: 8, color: C.tx, fontFamily: FN, fontSize: 14, padding: 12, resize: "vertical", outline: "none", boxSizing: "border-box" }} />
+
+      {/* 버튼 */}
+      <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 12 }}>
+        <button onClick={onCancel} style={{ background: "transparent", border: `1px solid ${C.bd}`, borderRadius: 8, color: C.txD, padding: "8px 16px", cursor: "pointer", fontSize: 13, fontFamily: FN }}>취소</button>
+        <button onClick={handleSubmit} style={{ background: C.ac, border: "none", borderRadius: 8, color: "#fff", padding: "8px 20px", cursor: "pointer", fontSize: 13, fontFamily: FN, fontWeight: 600 }}>추가 (⌘↵)</button>
+      </div>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════
+// ReviewCard
+// ═══════════════════════════════════════
+function ReviewCard({ card, onCheck, onDelete, onSeek, onEdit, images, currentTime, editorColor }) {
+  const [editing, setEditing] = useState(false);
+  const [editText, setEditText] = useState(card.content);
+  const [editCategory, setEditCategory] = useState(card.category);
+  const [editTsStart, setEditTsStart] = useState(card.timestamp);
+  const [editTsEnd, setEditTsEnd] = useState(card.timestampEnd);
+  const cat = CATEGORIES.find(c => c.value === (editing ? editCategory : card.category)) || CATEGORIES[4];
+  const catColor = CAT_COLORS[editing ? editCategory : card.category] || CAT_COLORS.etc;
+  const imgSrc = images[card.id];
+  const leftBarColor = editorColor || "#9CA3AF";
+  const authorName = card.createdBy?.name || card.createdBy?.email || "작성자 정보 없음";
+
+  const startEdit = () => { setEditText(card.content); setEditCategory(card.category); setEditTsStart(card.timestamp); setEditTsEnd(card.timestampEnd); setEditing(true); };
+  const cancelEdit = () => { setEditText(card.content); setEditCategory(card.category); setEditTsStart(card.timestamp); setEditTsEnd(card.timestampEnd); setEditing(false); };
+  const saveEdit = () => { onEdit(card.id, { content: editText, category: editCategory, timestamp: editTsStart, timestampEnd: editTsEnd }); setEditing(false); };
+
+  return (
+    <div title={`작성자: ${authorName}`} style={{ background: card.checked ? "rgba(0,0,0,0.2)" : C.sf, border: `1px solid ${card.checked ? "rgba(255,255,255,0.05)" : C.bd}`, borderRadius: 12, padding: 16, marginBottom: 10, opacity: card.checked ? 0.65 : 1, transition: "all 0.2s", borderLeft: `3px solid ${leftBarColor}` }}>
+      {/* 헤더 */}
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          {editing ? (
+            <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+              <button onClick={() => setEditTsStart(currentTime)} title="현재 재생 시점"
+                style={{ background: "rgba(255,255,255,0.04)", border: `1px solid ${C.ac}`, borderRadius: 6, color: C.ac, fontFamily: "monospace", fontSize: 13, padding: "3px 8px", cursor: "pointer" }}>
+                ▶ {fmtTime(editTsStart)}</button>
+              <span style={{ color: C.txD, fontSize: 12 }}>~</span>
+              <button onClick={() => setEditTsEnd(currentTime)} title="현재 재생 시점"
+                style={{ background: "rgba(255,255,255,0.04)", border: `1px solid ${editTsEnd != null ? C.ac : C.bd}`, borderRadius: 6, color: editTsEnd != null ? C.ac : C.txD, fontFamily: "monospace", fontSize: 13, padding: "3px 8px", cursor: "pointer" }}>
+                {editTsEnd != null ? fmtTime(editTsEnd) : "끝"}</button>
+              {editTsEnd != null && <button onClick={() => setEditTsEnd(null)} style={{ background: "transparent", border: "none", color: C.txD, cursor: "pointer", fontSize: 11, padding: "2px 4px" }}>✕</button>}
+            </div>
+          ) : (
+            <button onClick={() => onSeek(card.timestamp)}
+              style={{ background: "rgba(255,255,255,0.04)", border: `1px solid ${C.bd}`, borderRadius: 6, color: C.ac, fontFamily: "monospace", fontSize: 13, padding: "3px 8px", cursor: "pointer", transition: "all 0.15s" }}>
+              ▶ {fmtTime(card.timestamp)}{card.timestampEnd != null && `~${fmtTime(card.timestampEnd)}`}</button>
+          )}
+          {!editing && <span style={{ fontSize: 12, color: catColor.color, background: catColor.bg, padding: "2px 8px", borderRadius: 4, fontFamily: FN }}>{cat.icon} {cat.label}</span>}
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <button onClick={() => onDelete(card.id)} title="삭제"
+            style={{ background: "transparent", border: "none", color: C.txD, cursor: "pointer", fontSize: 14, padding: 4, opacity: 0.5 }}
+            onMouseEnter={e => e.currentTarget.style.opacity = 1} onMouseLeave={e => e.currentTarget.style.opacity = 0.5}>🗑</button>
+          <button onClick={() => onCheck(card.id)}
+            style={{ borderRadius: 6, padding: "4px 10px", background: card.checked ? C.ok : "transparent", border: `2px solid ${card.checked ? C.ok : C.bd}`, cursor: "pointer", display: "flex", alignItems: "center", gap: 6, color: card.checked ? "#fff" : C.txD, fontSize: 12, transition: "all 0.15s", fontFamily: FN }}>
+            {card.checked ? "✓" : "☐"} 완료</button>
+        </div>
+      </div>
+
+      {/* 캡처 이미지 */}
+      {card.hasImage && imgSrc && <img src={`data:image/jpeg;base64,${imgSrc}`} alt="캡처" style={{ maxWidth: "100%", maxHeight: 240, borderRadius: 8, marginBottom: 10, border: `1px solid ${C.bd}` }} />}
+      {card.hasImage && !imgSrc && <div style={{ background: "rgba(255,255,255,0.04)", borderRadius: 8, padding: 20, marginBottom: 10, textAlign: "center", color: C.txD, fontSize: 13 }}>이미지 로딩 중...</div>}
+
+      {/* 내용 */}
+      {editing ? (
+        <div style={{ marginBottom: 8 }}>
+          <div style={{ display: "flex", gap: 6, marginBottom: 8, flexWrap: "wrap" }}>
+            {CATEGORIES.map(c => {
+              const cc = CAT_COLORS[c.value] || CAT_COLORS.etc;
+              return <button key={c.value} onClick={() => setEditCategory(c.value)}
+                style={{ background: editCategory === c.value ? cc.bg : "rgba(255,255,255,0.04)", border: `1px solid ${editCategory === c.value ? cc.color : C.bd}`, borderRadius: 5, padding: "2px 8px", cursor: "pointer", color: editCategory === c.value ? cc.color : C.txD, fontSize: 12, fontFamily: FN, transition: "all 0.15s" }}>
+                {c.icon} {c.label}</button>;
             })}
           </div>
+          <textarea value={editText} onChange={e => setEditText(e.target.value)}
+            style={{ width: "100%", minHeight: 60, background: "rgba(255,255,255,0.04)", border: `1px solid ${C.ac}`, borderRadius: 8, color: C.tx, fontFamily: FN, fontSize: 14, padding: 10, resize: "vertical", outline: "none", boxSizing: "border-box" }} />
+          <div style={{ display: "flex", gap: 6, marginTop: 6 }}>
+            <button onClick={saveEdit} style={{ background: C.ac, border: "none", borderRadius: 6, color: "#fff", padding: "4px 12px", cursor: "pointer", fontSize: 12 }}>저장</button>
+            <button onClick={cancelEdit} style={{ background: "transparent", border: `1px solid ${C.bd}`, borderRadius: 6, color: C.txD, padding: "4px 12px", cursor: "pointer", fontSize: 12 }}>취소</button>
+          </div>
         </div>
+      ) : (
+        <>
+          <p style={{ color: card.checked ? C.txD : C.tx, fontSize: 14, lineHeight: 1.6, margin: "0 0 8px 0", fontFamily: FN, textDecoration: card.checked ? "line-through" : "none", whiteSpace: "pre-wrap" }}>{card.content}</p>
+          <button onClick={startEdit} style={{ background: "transparent", border: "none", color: C.txD, fontSize: 12, cursor: "pointer", padding: 0, fontFamily: FN }}>✏️ 수정하기</button>
+        </>
       )}
+
+      {/* 답글 */}
+      {card.reply && <div style={{ marginTop: 8, padding: "8px 12px", borderRadius: 8, background: "rgba(108,156,252,0.08)", border: `1px solid rgba(108,156,252,0.2)`, fontSize: 13, color: C.txM }}>💬 {card.reply}</div>}
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════
+// ModifyTab (main export)
+// ═══════════════════════════════════════
+export function ModifyTab({ sessionId, config, onSave, currentTab, initialData, authUser }) {
+  const [view, setView] = useState("home"); // home | review
+  const [videoUrl, setVideoUrl] = useState("");
+  const [videoId, setVideoId] = useState("");
+  const [title, setTitle] = useState("");
+  const [cards, setCards] = useState([]);
+  const [images, setImages] = useState({});
+  const [showForm, setShowForm] = useState(false);
+  const [currentTime, setCurrentTime] = useState(0);
+  const [filter, setFilter] = useState("all");
+  const [loaded, setLoaded] = useState(false);
+  const [autoSaveStatus, setAutoSaveStatus] = useState("");
+
+  const playerRef = useRef(null);
+  const autoSaveTimer = useRef(null);
+  const lastSnapshot = useRef("");
+  const timeInterval = useRef(null);
+
+  const base = config?.workerUrl || "";
+
+  // initialData에서 복원 (페이지 새로고침 후, KV 로드 전)
+  const restoredRef = useRef(false);
+  useEffect(() => {
+    if (restoredRef.current || loaded || !initialData) return;
+    if (initialData.videoId || initialData.cards?.length > 0) {
+      setVideoUrl(initialData.videoUrl || "");
+      setVideoId(initialData.videoId || "");
+      setTitle(initialData.title || "");
+      setCards(initialData.cards || []);
+      lastSnapshot.current = JSON.stringify(initialData.cards || []);
+      if (initialData.videoId) setView("review");
+      restoredRef.current = true;
+    }
+  }, [initialData, loaded]);
+
+  // 탭 비활성화 시 즉시 저장
+  const prevTabRef = useRef(currentTab);
+  useEffect(() => {
+    if (prevTabRef.current === "modify" && currentTab !== "modify") {
+      if ((cards.length > 0 || videoId) && onSave) {
+        onSave({ videoUrl, videoId, title, cards, savedAt: new Date().toISOString() });
+      }
+    }
+    prevTabRef.current = currentTab;
+  }, [currentTab]);
+
+  // ── 세션 로드 ──
+  // CMS v2 — 부모가 meta.stages 기반 initialData 박음. restoredRef → fetch skip.
+  useEffect(() => {
+    if (!sessionId || !base || loaded || restoredRef.current) return;
+    let cancelled = false;
+    const t = setTimeout(async () => {
+      if (cancelled || restoredRef.current) return;
+      try {
+        const _tk = localStorage.getItem("ttimes_token");
+        const _ah = _tk ? { "Authorization": `Bearer ${_tk}` } : {};
+        const r = await fetch(`${base}/load/${sessionId}/modify`, { headers: _ah });
+        if (!r.ok) { setLoaded(true); return; }
+        const d = await r.json();
+        {
+          const data = d?.data || d; // data.data (레거시) 또는 d 직접
+          setVideoUrl(data.videoUrl || "");
+          setVideoId(data.videoId || "");
+          setTitle(data.title || "");
+          setCards(data.cards || []);
+          lastSnapshot.current = JSON.stringify(data.cards || []);
+          if (data.videoId) setView("review");
+          // 이미지 lazy-load
+          const imgCards = (data.cards || []).filter(c => c.hasImage);
+          for (const c of imgCards) {
+            try {
+              const ir = await fetch(`${base}/image/${sessionId}/${c.id}`, { headers: _ah });
+              if (ir.ok) {
+                const id2 = await ir.json();
+                if (id2.imageData) setImages(prev => ({ ...prev, [c.id]: id2.imageData }));
+              }
+            } catch {}
+          }
+        }
+        setLoaded(true);
+      } catch { setLoaded(true); }
+    }, 300); // CMS v2 — 부모 initialData 시간 부여
+    return () => { cancelled = true; clearTimeout(t); };
+  }, [sessionId, base, loaded]);
+
+  // ── 디바운스 자동저장 ──
+  useEffect(() => {
+    if (!cards.length && !videoId) return;
+    const snap = JSON.stringify(cards);
+    if (snap === lastSnapshot.current) return;
+    // CMS v2 — 자식 → 부모 즉시 onSave (디바운스 X). 부모가 KV PUT 디바운스 처리.
+    saveNow(cards);
+  }, [cards, title]);
+
+  const saveNow = useCallback(async (cardsToSave) => {
+    if (!sessionId) return;
+    try {
+      setAutoSaveStatus("💾 저장 중...");
+      await onSave?.({ videoUrl, videoId, title, cards: cardsToSave, savedAt: new Date().toISOString() });
+      lastSnapshot.current = JSON.stringify(cardsToSave);
+      if (autoSaveTimer.current) { clearTimeout(autoSaveTimer.current); autoSaveTimer.current = null; }
+      setAutoSaveStatus("✓ 저장됨");
+      setTimeout(() => setAutoSaveStatus(""), 3000);
+    } catch (e) {
+      console.error("수정사항 저장 실패:", e);
+      setAutoSaveStatus("❌ 저장 실패 — 새로고침 전에 다시 시도하세요");
+    }
+  }, [sessionId, videoUrl, videoId, title, onSave]);
+
+  // M5 — ModifyTab 자체 keepalive 영역 폐기 (헌장 §5 / §6 정식 충족).
+  // 이전 결함: App.jsx pagehide useEffect (단일 dispatcher) 영역 우회 → race / 비대칭.
+  // 현재: App.jsx pagehide 영역이 11 탭 동등 fetch keepalive 영역으로 일괄 처리.
+  // = 11 탭 모두 동등 — modify 영역의 자체 path 영역 X (헌장 §6 정합).
+
+  function handlePlayerReady(player) {
+    playerRef.current = player;
+    if (timeInterval.current) clearInterval(timeInterval.current);
+    timeInterval.current = setInterval(() => {
+      if (playerRef.current?.getCurrentTime) {
+        setCurrentTime(playerRef.current.getCurrentTime());
+      }
+    }, 500);
+  }
+
+  function handleStart() {
+    const vid = parseYouTubeId(videoUrl);
+    if (!vid) return;
+    setVideoId(vid);
+    setCards([]);
+    setImages({});
+    lastSnapshot.current = "";
+    setView("review");
+    // 즉시 저장
+    onSave?.({ videoUrl, videoId: vid, title: title || "새 리뷰", cards: [], savedAt: new Date().toISOString() });
+  }
+
+  async function handleAddCard(card) {
+    // 작성자 정보 주입 (편집자 식별용)
+    const cardWithAuthor = authUser
+      ? { ...card, createdBy: { email: authUser.email, name: authUser.name || authUser.email } }
+      : card;
+    const newCards = [...cards, cardWithAuthor].sort((a, b) => a.timestamp - b.timestamp);
+    setCards(newCards);
+    setShowForm(false);
+    // 이미지 업로드
+    if (card.imageData && sessionId && base) {
+      try {
+        const _tk2 = localStorage.getItem("ttimes_token");
+        await fetch(`${base}/save-image`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", ...(_tk2 ? { "Authorization": `Bearer ${_tk2}` } : {}) },
+          body: JSON.stringify({ sessionId, cardId: card.id, imageData: card.imageData }),
+        });
+        setImages(prev => ({ ...prev, [card.id]: card.imageData }));
+      } catch { console.error("image save failed"); }
+    }
+    saveNow(newCards);
+  }
+
+  function handleCheck(cardId) {
+    const newCards = cards.map(c => c.id === cardId ? { ...c, checked: !c.checked } : c);
+    setCards(newCards);
+    saveNow(newCards);
+  }
+
+  function handleEdit(cardId, updates) {
+    const newCards = cards.map(c => c.id === cardId ? { ...c, ...updates } : c);
+    setCards(newCards);
+    saveNow(newCards); // 즉시 저장 — 편집 후 뒤로가기/새로고침 시 손실 방지
+  }
+
+  async function handleDelete(cardId) {
+    const card = cards.find(c => c.id === cardId);
+    const newCards = cards.filter(c => c.id !== cardId);
+    setCards(newCards);
+    if (card?.hasImage && sessionId && base) {
+      try { const _tk3 = localStorage.getItem("ttimes_token"); await fetch(`${base}/image/${sessionId}/${cardId}`, { method: "DELETE", headers: _tk3 ? { "Authorization": `Bearer ${_tk3}` } : {} }); } catch {}
+      setImages(prev => { const n = { ...prev }; delete n[cardId]; return n; });
+    }
+    saveNow(newCards);
+  }
+
+  function handleSeek(sec) {
+    if (playerRef.current?.seekTo) {
+      playerRef.current.seekTo(sec, true);
+      playerRef.current.playVideo();
+      setTimeout(() => { try { playerRef.current.pauseVideo(); } catch {} }, 300);
+    }
+  }
+
+  function handleReset() {
+    setView("home"); setVideoUrl(""); setVideoId(""); setTitle(""); setCards([]); setImages({});
+    setShowForm(false); lastSnapshot.current = ""; setAutoSaveStatus("");
+    if (playerRef.current) try { playerRef.current.destroy(); } catch {}
+    playerRef.current = null;
+    if (timeInterval.current) clearInterval(timeInterval.current);
+  }
+
+  const filteredCards = cards.filter(c => {
+    if (filter === "unchecked") return !c.checked;
+    if (filter === "checked") return c.checked;
+    return true;
+  }).sort((a, b) => {
+    if (a.checked !== b.checked) return a.checked ? 1 : -1;
+    return a.timestamp - b.timestamp;
+  });
+
+  const stats = { total: cards.length, checked: cards.filter(c => c.checked).length };
+
+  // 편집자 → 색상 맵 (카드 등장 순서대로)
+  const editorColorMap = useMemo(() => buildEditorColorMap(cards), [cards]);
+
+  // ═══════════════════════════════════════
+  // HOME VIEW
+  // ═══════════════════════════════════════
+  if (view === "home") {
+    return (
+      <div style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: 40 }}>
+        <div style={{ maxWidth: 640, width: "100%" }}>
+          <h2 style={{ fontSize: 20, fontWeight: 700, marginBottom: 8, color: C.tx }}>🎬 영상 수정사항</h2>
+          <p style={{ fontSize: 13, color: C.txD, marginBottom: 24 }}>영상을 보면서 타임코드 기반으로 수정 사항을 기록합니다</p>
+
+          <div style={{ background: C.sf, border: `1px solid ${C.bd}`, borderRadius: 12, padding: 24 }}>
+            <label style={{ fontSize: 13, color: C.txD, display: "block", marginBottom: 8 }}>YouTube URL</label>
+            <input value={videoUrl} onChange={e => setVideoUrl(e.target.value)}
+              placeholder="https://www.youtube.com/watch?v=..."
+              style={{ width: "100%", background: "rgba(255,255,255,0.04)", border: `1px solid ${C.bd}`, borderRadius: 8, color: C.tx, fontFamily: "monospace", fontSize: 14, padding: "10px 14px", outline: "none", boxSizing: "border-box", marginBottom: 12 }} />
+            <label style={{ fontSize: 13, color: C.txD, display: "block", marginBottom: 8 }}>리뷰 제목 (선택)</label>
+            <input value={title} onChange={e => setTitle(e.target.value)}
+              placeholder="예: 박종천 2편 최종 리뷰"
+              style={{ width: "100%", background: "rgba(255,255,255,0.04)", border: `1px solid ${C.bd}`, borderRadius: 8, color: C.tx, fontFamily: FN, fontSize: 14, padding: "10px 14px", outline: "none", boxSizing: "border-box", marginBottom: 16 }} />
+            <button onClick={handleStart} disabled={!parseYouTubeId(videoUrl)}
+              style={{ width: "100%", background: parseYouTubeId(videoUrl) ? C.ac : "rgba(255,255,255,0.06)", border: "none", borderRadius: 8, color: parseYouTubeId(videoUrl) ? "#fff" : C.txD, padding: "12px 0", cursor: parseYouTubeId(videoUrl) ? "pointer" : "not-allowed", fontSize: 15, fontWeight: 600, fontFamily: FN }}>
+              리뷰 시작</button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // ═══════════════════════════════════════
+  // REVIEW VIEW
+  // ═══════════════════════════════════════
+  return (
+    <div style={{ flex: 1, overflow: "auto" }}>
+      <div style={{ maxWidth: 800, margin: "0 auto", padding: "16px 16px 80px" }}>
+        {/* 헤더 */}
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16, flexWrap: "wrap", gap: 8 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+            <button onClick={handleReset}
+              style={{ background: "transparent", border: `1px solid ${C.bd}`, borderRadius: 6, color: C.txD, padding: "4px 10px", cursor: "pointer", fontSize: 13 }}>← 홈</button>
+            <input value={title} onChange={e => setTitle(e.target.value)} placeholder="리뷰 제목"
+              style={{ background: "transparent", border: "none", color: C.tx, fontSize: 17, fontWeight: 600, outline: "none", fontFamily: FN, width: 240 }} />
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            {autoSaveStatus && <span style={{ fontSize: 12, color: C.txD }}>{autoSaveStatus}</span>}
+            <span style={{ fontSize: 13, fontFamily: "monospace", color: stats.checked === stats.total && stats.total > 0 ? C.ok : C.txD }}>
+              {stats.checked}/{stats.total}</span>
+          </div>
+        </div>
+
+        {/* YouTube Player */}
+        <div style={{ marginBottom: 16 }}>
+          <YouTubePlayer videoId={videoId} onPlayerReady={handlePlayerReady} />
+        </div>
+
+        {/* 수정 요청 추가 */}
+        {!showForm ? (
+          <button onClick={() => setShowForm(true)}
+            style={{ width: "100%", background: C.sf, border: `1px dashed ${C.bd}`, borderRadius: 10, padding: "14px 0", cursor: "pointer", color: C.ac, fontSize: 14, fontFamily: FN, marginBottom: 16, transition: "all 0.15s" }}
+            onMouseEnter={e => e.currentTarget.style.borderColor = C.ac} onMouseLeave={e => e.currentTarget.style.borderColor = C.bd}>
+            ➕ 수정 요청 추가 &nbsp;<span style={{ color: C.txD, fontFamily: "monospace", fontSize: 13 }}>(현재 ▶ {fmtTime(currentTime)})</span></button>
+        ) : (
+          <CardForm currentTime={currentTime} onSubmit={handleAddCard} onCancel={() => setShowForm(false)} />
+        )}
+
+        {/* 필터 */}
+        {cards.length > 0 && (
+          <div style={{ display: "flex", gap: 6, marginBottom: 14 }}>
+            {[
+              { v: "all", l: `전체 (${stats.total})` },
+              { v: "unchecked", l: `미완료 (${stats.total - stats.checked})` },
+              { v: "checked", l: `완료 (${stats.checked})` },
+            ].map(f => (
+              <button key={f.v} onClick={() => setFilter(f.v)}
+                style={{ background: filter === f.v ? C.acS : "transparent", border: `1px solid ${filter === f.v ? C.ac : C.bd}`, borderRadius: 6, padding: "4px 10px", cursor: "pointer", color: filter === f.v ? C.ac : C.txD, fontSize: 12, fontFamily: FN }}>
+                {f.l}</button>
+            ))}
+          </div>
+        )}
+
+        {/* 카드 리스트 */}
+        {filteredCards.map(card => (
+          <ReviewCard key={card.id} card={card} images={images} currentTime={currentTime}
+            editorColor={editorColorMap[card.createdBy?.email] || EDITOR_COLOR_DEFAULT}
+            onCheck={handleCheck} onEdit={handleEdit} onDelete={handleDelete} onSeek={handleSeek} />
+        ))}
+
+        {cards.length === 0 && (
+          <div style={{ textAlign: "center", padding: 60, color: C.txD, fontSize: 14 }}>
+            영상을 보면서 수정할 부분이 있으면<br />위 버튼을 눌러 추가해주세요</div>
+        )}
+      </div>
     </div>
   );
 }

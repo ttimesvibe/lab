@@ -1,41 +1,28 @@
-// lab fresh v2 — frontend config
-// 사료: editor/ops/lab-v2-fresh-2026-05-09.md (S2'.5 te_cfg 격리 + S2.6 drift guard)
+// ═══════════════════════════════════════════════
+// CONFIG & PERSISTENCE
+// ═══════════════════════════════════════════════
 
-// ★ Canonical Worker URL (build drift guard 검증 대상)
-// docs/build.js 의 CANONICAL_WORKER_URL 과 같은 commit 에서 함께 수정 의무.
-// 양쪽 불일치 시 prebuild drift guard 가 빌드 차단.
-const CANONICAL_WORKER_URL = "https://lab.ttimes.workers.dev";
+export const DEFAULT_CONFIG = {
+  apiMode: "live",
+  workerUrl: "https://lab.ttimes.workers.dev",  // ★ lab Worker (test) — prod alleditor 와 분리
+  fillers: ["이제","또","좀","뭐","그냥","약간","진짜","되게","막","이렇게","저렇게"],
+  customTerms: {},
+  chunkSize: 8000,
+};
 
-export const DEFAULT_CONFIG = Object.freeze({
-  workerUrl: CANONICAL_WORKER_URL,
-  apiMode: "live",       // mock | live
-  fillerWords: ["음", "어", "그", "막", "뭐", "이제"],
-  chunkSize: 60,         // subtitle 어절 단위
-});
-
-// te_cfg localStorage 의 workerUrl 무시 (4/24 drift 사고 후속)
-// → 사용자 설정에서 workerUrl 변경 불가, build 타임 박힌 canonical 강제
-// → PROD/TEST/lab 같은 origin (ttimesvibe.github.io) 공유 영역의 KV 섞임 차단
+// ★ workerUrl 은 빌드 타임 상수 (DEFAULT_CONFIG.workerUrl) 만 사용.
+//   브라우저 localStorage 의 te_cfg 에 workerUrl 이 박혀 있어도 런타임에 무시.
+//   동일 origin(ttimesvibe.github.io) 에 editor(PROD) 와 ttimes-editor(TEST) 가
+//   공존해 localStorage 를 공유하므로, 한쪽 설정 저장이 다른쪽 워커 호출을
+//   유발하는 KV 섞임 사고를 물리적으로 차단.
 export function loadConfig() {
-  let stored = {};
   try {
-    const raw = localStorage.getItem("te_cfg");
-    if (raw) stored = JSON.parse(raw);
-  } catch {
-    stored = {};
-  }
-  return {
-    ...DEFAULT_CONFIG,
-    ...stored,
-    workerUrl: DEFAULT_CONFIG.workerUrl,  // ★ te_cfg 의 workerUrl 무시 (격리 의무)
-  };
+    const cached = JSON.parse(localStorage.getItem("te_cfg") || "{}");
+    return { ...DEFAULT_CONFIG, ...cached, workerUrl: DEFAULT_CONFIG.workerUrl };
+  } catch { return { ...DEFAULT_CONFIG }; }
 }
-
-export function saveConfig(cfg) {
-  try {
-    const { workerUrl, ...rest } = cfg;  // workerUrl 제외 (격리)
-    localStorage.setItem("te_cfg", JSON.stringify(rest));
-  } catch {
-    // localStorage 가득 참 등 — silent
-  }
+export function saveConfig(c) {
+  // workerUrl 은 저장 대상에서 제외 (빌드 타임 상수만 권위 있는 값)
+  const { workerUrl, ...rest } = c || {};
+  localStorage.setItem("te_cfg", JSON.stringify(rest));
 }

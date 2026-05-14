@@ -1,17 +1,17 @@
-// lab fresh v2 — clientMerge re-export
-// 사료: 묶음 ⑫ M11 — 클라 머지 = 서버 머지 동일 모듈
-//
-// _mergeImpl.js 의 mergeTabData 를 그대로 re-export.
-// 호출자 (App.jsx, ConflictModal "동기화" 옵션) 는 본 모듈만 import.
+// CMS v2 — 클라이언트 머지 (B3 옵션 "양쪽 합치기" / M11)
+// worker/merge.js 와 동일 로직. sibling _mergeImpl.js 에 사본 (Vite 빌드 호환).
+// 변경 시 양쪽 동기화 의무 (worker/merge.js → docs/src/utils/_mergeImpl.js cp).
+// 단위 테스트 (worker/__tests__/mergeTabData.test.js) 가 양쪽 일치 보증.
 
 export {
-  mergeTabData as clientMergeTabData,
-  deepMerge,
-  arrayIdUnion,
-  arrayStableIdUnion,
-  objectMergeArrayUnion,
-  sanitizePayload,
   PROTO_KEYS,
   MAX_DEPTH,
   MERGE_STRATEGIES,
+  sanitizePayload,
+  deepMerge,
+  arrayIdUnion,
+  mergeObjectWithArrayUnion,
+  mergeTabData,
+  validateMergeResult,
+  detectConflict,
 } from "./_mergeImpl.js";

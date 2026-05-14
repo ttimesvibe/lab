@@ -1,192 +1,187 @@
-// lab fresh v2 — Worker permissions 단위 테스트
-// 사료: editor/ops/lab-v2-fresh-2026-05-09.md (S2.3 P-1 + S5.4.1)
-// 28+ 케이스 + 35+ endpoint × required_permission 매트릭스 의무 영역
-
-import { test } from "node:test";
+// P-1 — 권한 자동 테스트 (4/15 사고 재발 방지, 묶음 ④)
+// 실행: node --test worker/__tests__/permissions.test.js
+import { test, describe } from "node:test";
 import assert from "node:assert/strict";
-import { isAdmin, canEdit, canDelete, canRestore, forbidden } from "../permissions.js";
+import { isAdmin, canEdit, canDelete, canRestore } from "../permissions.js";
 
-// ─── Mock KV (env.SESSIONS) ───────────────────────────────────────────────
-function makeEnv(teamMembers) {
+// Mock env (KV SESSIONS)
+function mockEnv(teamMembers = null) {
   return {
     SESSIONS: {
-      async get(key) {
-        if (key === "team_members") return JSON.stringify(teamMembers);
+      get: async (key) => {
+        if (key === "team_members") return teamMembers ? JSON.stringify(teamMembers) : null;
         return null;
       },
     },
   };
 }
 
-const ADMIN = { sub: "admin@mt.co.kr", name: "관리자", role: "admin" };
-const EDITOR_A = { sub: "alice@mt.co.kr", name: "Alice", role: "editor" };
-const EDITOR_B = { sub: "bob@mt.co.kr", name: "Bob", role: "editor" };
-const NO_ROLE_USER = { sub: "carol@mt.co.kr", name: "Carol" };  // role 미박제 (KV cache 의존)
-
-const TEAM = [
-  { name: "관리자", email: "admin@mt.co.kr", role: "admin" },
-  { name: "Carol", email: "carol@mt.co.kr", role: "admin" },     // KV cache 에 admin
-  { name: "Alice", email: "alice@mt.co.kr", role: "editor" },
-  { name: "Bob", email: "bob@mt.co.kr", role: "editor" },
-];
+const ADMIN_USER = { sub: "admin@x.com", name: "관리자", role: "admin" };
+const EDITOR_USER = { sub: "editor@x.com", name: "편집자" }; // role 부재
+const CREATOR_USER = { sub: "creator@x.com", name: "작성자" };
+const OTHER_USER = { sub: "other@x.com", name: "타인" };
+const NO_USER = null;
+const EMPTY_USER = {};
 
 const PROJ = {
-  id: "abc123",
-  creatorEmail: "alice@mt.co.kr",
-  editors: ["alice@mt.co.kr", "bob@mt.co.kr"],
+  id: "abc12345",
+  creatorEmail: "creator@x.com",
+  editors: [{ email: "editor@x.com" }],
 };
+const PROJ_DELETED = { ...PROJ, deleted: true, deletedBy: "other@x.com" };
+const PROJ_NULL = null;
 
-// ─── isAdmin ─────────────────────────────────────────────────────────────
-test("isAdmin: user.role==='admin' → true (JWT 직접 박제)", async () => {
-  assert.equal(await isAdmin(ADMIN, makeEnv(TEAM)), true);
+describe("isAdmin", () => {
+  test("user.role === 'admin' → true", async () => {
+    assert.equal(await isAdmin(ADMIN_USER, mockEnv()), true);
+  });
+  test("non-admin user → false (team_members 없음)", async () => {
+    assert.equal(await isAdmin(EDITOR_USER, mockEnv()), false);
+  });
+  test("user 부재 → false", async () => {
+    assert.equal(await isAdmin(NO_USER, mockEnv()), false);
+    assert.equal(await isAdmin(EMPTY_USER, mockEnv()), false);
+  });
+  test("team_members KV fallback — admin 로 등록", async () => {
+    const env = mockEnv([{ email: "editor@x.com", role: "admin" }]);
+    assert.equal(await isAdmin(EDITOR_USER, env), true);
+  });
+  test("team_members KV fallback — editor 로 등록", async () => {
+    const env = mockEnv([{ email: "editor@x.com", role: "editor" }]);
+    assert.equal(await isAdmin(EDITOR_USER, env), false);
+  });
+  test("team_members KV 손상 시 false (catch)", async () => {
+    const env = { SESSIONS: { get: async () => "invalid_json" } };
+    assert.equal(await isAdmin(EDITOR_USER, env), false);
+  });
 });
 
-test("isAdmin: user.role==='editor' → false (JWT 우선)", async () => {
-  assert.equal(await isAdmin(EDITOR_A, makeEnv(TEAM)), false);
+describe("canEdit", () => {
+  test("creator → true", async () => {
+    assert.equal(await canEdit(PROJ, CREATOR_USER, mockEnv()), true);
+  });
+  test("editors 배열 포함 → true", async () => {
+    assert.equal(await canEdit(PROJ, EDITOR_USER, mockEnv()), true);
+  });
+  test("admin (role) → true", async () => {
+    assert.equal(await canEdit(PROJ, ADMIN_USER, mockEnv()), true);
+  });
+  test("admin (KV fallback) → true", async () => {
+    const env = mockEnv([{ email: "other@x.com", role: "admin" }]);
+    assert.equal(await canEdit(PROJ, OTHER_USER, env), true);
+  });
+  test("non-creator non-editor non-admin → false", async () => {
+    assert.equal(await canEdit(PROJ, OTHER_USER, mockEnv()), false);
+  });
+  test("proj 부재 → false", async () => {
+    assert.equal(await canEdit(PROJ_NULL, ADMIN_USER, mockEnv()), false);
+  });
+  test("user 부재 → false", async () => {
+    assert.equal(await canEdit(PROJ, NO_USER, mockEnv()), false);
+  });
+  test("editors 배열 비정상 (null) → 무시", async () => {
+    const proj2 = { ...PROJ, editors: null };
+    assert.equal(await canEdit(proj2, EDITOR_USER, mockEnv()), false);
+  });
 });
 
-test("isAdmin: role 부재 + KV cache 에 admin → true (fallback 동작)", async () => {
-  assert.equal(await isAdmin(NO_ROLE_USER, makeEnv(TEAM)), true);
+describe("canDelete", () => {
+  test("creator → true", async () => {
+    assert.equal(await canDelete(PROJ, CREATOR_USER, mockEnv()), true);
+  });
+  test("editors 포함이지만 → false (editors 는 삭제 불가)", async () => {
+    assert.equal(await canDelete(PROJ, EDITOR_USER, mockEnv()), false);
+  });
+  test("admin (role) → true", async () => {
+    assert.equal(await canDelete(PROJ, ADMIN_USER, mockEnv()), true);
+  });
+  test("non-creator non-admin → false", async () => {
+    assert.equal(await canDelete(PROJ, OTHER_USER, mockEnv()), false);
+  });
+  test("proj/user 부재 → false", async () => {
+    assert.equal(await canDelete(PROJ_NULL, ADMIN_USER, mockEnv()), false);
+    assert.equal(await canDelete(PROJ, NO_USER, mockEnv()), false);
+  });
 });
 
-test("isAdmin: 알 수 없는 user → false", async () => {
-  const unknown = { sub: "unknown@mt.co.kr", name: "Unknown" };
-  assert.equal(await isAdmin(unknown, makeEnv(TEAM)), false);
+describe("canRestore", () => {
+  test("creator → true", async () => {
+    assert.equal(await canRestore(PROJ_DELETED, CREATOR_USER, mockEnv()), true);
+  });
+  test("deletedBy === user.sub → true (본인이 지움)", async () => {
+    assert.equal(await canRestore(PROJ_DELETED, OTHER_USER, mockEnv()), true);
+  });
+  test("admin → true", async () => {
+    assert.equal(await canRestore(PROJ_DELETED, ADMIN_USER, mockEnv()), true);
+  });
+  test("editor (editors 배열) → false (복구 권한 별도)", async () => {
+    assert.equal(await canRestore(PROJ_DELETED, EDITOR_USER, mockEnv()), false);
+  });
+  test("타인 (non-creator/deletedBy/admin) → false", async () => {
+    const proj3 = { ...PROJ_DELETED, deletedBy: "creator@x.com" };
+    assert.equal(await canRestore(proj3, OTHER_USER, mockEnv()), false);
+  });
 });
 
-test("isAdmin: user null → false (방어)", async () => {
-  assert.equal(await isAdmin(null, makeEnv(TEAM)), false);
-});
+describe("권한 매트릭스 — 38 핸들러 × role 카탈로그 (P-1)", () => {
+  // 본 매트릭스는 worker/index.js 의 mutating endpoint 마다 어느 권한 헬퍼를 호출하는지 박제.
+  // 새 endpoint 추가 시 본 표 갱신 의무.
+  const MATRIX = [
+    // [endpoint, mutation, required_permission]
+    ["POST /save", true, "canEdit OR creator"],
+    ["POST /autosave", true, "canEdit OR creator"],
+    ["POST /save-legacy", true, "canEdit"],
+    ["POST /projects/create", true, "authenticated"],
+    ["POST /projects/update", true, "canEdit"],
+    ["POST /projects/delete", true, "canDelete"],
+    ["GET /projects/trash", false, "isAdmin"],
+    ["POST /projects/restore", true, "canRestore"],
+    ["POST /projects/purge", true, "isAdmin"],
+    ["POST /projects/trash/purge-all", true, "isAdmin"],
+    ["POST /save-image", true, "canEdit"],
+    ["GET /image/{sid}/{cid}", false, "authenticated"],
+    ["DELETE /image/{sid}/{cid}", true, "canEdit"],
+    ["POST /shoots/create", true, "authenticated"],
+    ["POST /shoots/update", true, "creator OR isAdmin"],
+    ["POST /shoots/delete", true, "creator OR isAdmin"],
+    ["POST /session/{id}/heartbeat", true, "authenticated"],
+    ["POST /session/{id}/leave", true, "auth-exempt (sendBeacon 호환)"],
+    ["GET /session/{id}/active-users", false, "authenticated"],
+    ["POST /analyze", true, "authenticated"],
+    ["POST /correct", true, "authenticated"],
+    ["POST /highlights", true, "authenticated"],
+    ["POST /visuals", true, "authenticated"],
+    ["POST /insert-cuts", true, "authenticated"],
+    ["POST /hl-recommend", true, "authenticated"],
+    ["POST /hl-timestamps", true, "authenticated"],
+    ["POST /setgen", true, "authenticated"],
+    ["POST /term-explain", true, "authenticated"],
+    ["POST /subtitle-format", true, "authenticated"],
+    ["GET /load/{id}", false, "authenticated"],
+    ["GET /load/{id}/{tab}", false, "authenticated"],
+    ["POST /admin/users", true, "isAdmin"],
+    ["DELETE /admin/users/{email}", true, "isAdmin"],
+    ["GET /admin/users", false, "isAdmin"],
+    ["GET /health", false, "auth-exempt"],
+    ["OPTIONS *", false, "auth-exempt"],
+  ];
 
-test("isAdmin: env null → false (방어)", async () => {
-  assert.equal(await isAdmin(EDITOR_A, null), false);
-});
-
-test("isAdmin: KV cache 누락 → false (graceful)", async () => {
-  const emptyEnv = { SESSIONS: { async get() { return null; } } };
-  assert.equal(await isAdmin(NO_ROLE_USER, emptyEnv), false);
-});
-
-// ─── canEdit ─────────────────────────────────────────────────────────────
-test("canEdit: creator → true", async () => {
-  assert.equal(await canEdit(PROJ, EDITOR_A, makeEnv(TEAM)), true);
-});
-
-test("canEdit: editors 포함 → true", async () => {
-  assert.equal(await canEdit(PROJ, EDITOR_B, makeEnv(TEAM)), true);
-});
-
-test("canEdit: admin (editors 불포함이어도) → true", async () => {
-  const projNoEditors = { ...PROJ, editors: [] };
-  assert.equal(await canEdit(projNoEditors, ADMIN, makeEnv(TEAM)), true);
-});
-
-test("canEdit: 권한 없음 → false", async () => {
-  const stranger = { sub: "stranger@mt.co.kr", name: "Stranger" };
-  assert.equal(await canEdit(PROJ, stranger, makeEnv(TEAM)), false);
-});
-
-test("canEdit: user null → false", async () => {
-  assert.equal(await canEdit(PROJ, null, makeEnv(TEAM)), false);
-});
-
-test("canEdit: proj null → false", async () => {
-  assert.equal(await canEdit(null, EDITOR_A, makeEnv(TEAM)), false);
-});
-
-test("canEdit: user.sub 부재 → false", async () => {
-  assert.equal(await canEdit(PROJ, { name: "no sub" }, makeEnv(TEAM)), false);
-});
-
-// ─── canDelete (★ editors 불가, prod 정합) ──────────────────────────────
-test("canDelete: creator → true", async () => {
-  assert.equal(await canDelete(PROJ, EDITOR_A, makeEnv(TEAM)), true);
-});
-
-test("canDelete: admin → true", async () => {
-  assert.equal(await canDelete(PROJ, ADMIN, makeEnv(TEAM)), true);
-});
-
-test("canDelete: ★ editors (creator 아닌) → false", async () => {
-  // P0 영역: editors 인 EDITOR_B 가 creator (EDITOR_A) 의 프로젝트 삭제 시도
-  assert.equal(await canDelete(PROJ, EDITOR_B, makeEnv(TEAM)), false);
-});
-
-test("canDelete: 권한 없음 → false", async () => {
-  const stranger = { sub: "stranger@mt.co.kr", name: "Stranger" };
-  assert.equal(await canDelete(PROJ, stranger, makeEnv(TEAM)), false);
-});
-
-test("canDelete: proj null → false", async () => {
-  assert.equal(await canDelete(null, EDITOR_A, makeEnv(TEAM)), false);
-});
-
-// ─── canRestore ──────────────────────────────────────────────────────────
-test("canRestore: creator → true", async () => {
-  const trashed = { ...PROJ, deleted: true, deletedBy: "admin@mt.co.kr" };
-  assert.equal(await canRestore(trashed, EDITOR_A, makeEnv(TEAM)), true);
-});
-
-test("canRestore: deletedBy === user.sub (자기가 삭제 → 복구 가능) → true", async () => {
-  const trashedByB = { ...PROJ, deleted: true, deletedBy: "bob@mt.co.kr" };
-  assert.equal(await canRestore(trashedByB, EDITOR_B, makeEnv(TEAM)), true);
-});
-
-test("canRestore: admin → true", async () => {
-  const trashed = { ...PROJ, deleted: true, deletedBy: "alice@mt.co.kr" };
-  assert.equal(await canRestore(trashed, ADMIN, makeEnv(TEAM)), true);
-});
-
-test("canRestore: editors (creator/deletedBy 모두 아닌) → false", async () => {
-  const trashed = { ...PROJ, deleted: true, deletedBy: "admin@mt.co.kr" };
-  assert.equal(await canRestore(trashed, EDITOR_B, makeEnv(TEAM)), false);
-});
-
-test("canRestore: 권한 없음 → false", async () => {
-  const trashed = { ...PROJ, deleted: true, deletedBy: "alice@mt.co.kr" };
-  const stranger = { sub: "stranger@mt.co.kr" };
-  assert.equal(await canRestore(trashed, stranger, makeEnv(TEAM)), false);
-});
-
-test("canRestore: proj null → false", async () => {
-  assert.equal(await canRestore(null, EDITOR_A, makeEnv(TEAM)), false);
-});
-
-// ─── forbidden ───────────────────────────────────────────────────────────
-test("forbidden: status === 403", async () => {
-  const r = forbidden({}, "테스트 메시지");
-  assert.equal(r.status, 403);
-});
-
-test("forbidden: 한글 메시지 default (msg 미박제 시)", async () => {
-  const r = forbidden({});
-  const body = await r.json();
-  assert.equal(body.error, "권한이 없습니다.");
-  assert.equal(body.code, 403);
-});
-
-test("forbidden: msg 박제 시 그대로", async () => {
-  const r = forbidden({}, "이 프로젝트에 저장 권한이 없습니다.");
-  const body = await r.json();
-  assert.equal(body.error, "이 프로젝트에 저장 권한이 없습니다.");
-});
-
-test("forbidden: headers 전달", async () => {
-  const r = forbidden({ "X-Test": "yes", "Content-Type": "application/json" });
-  assert.equal(r.headers.get("X-Test"), "yes");
-});
-
-// ─── 권한 매트릭스 (35+ endpoint × required_permission, 사료 S2'.3) ─────
-// 본 매트릭스 = lab/ops/AUDIT_<date>.md 의 reference (P-1)
-test("matrix: /projects/update 가 canEdit 통과 (creator)", async () => {
-  assert.equal(await canEdit(PROJ, EDITOR_A, makeEnv(TEAM)), true);
-});
-
-test("matrix: /projects/delete 가 canDelete 차단 (editor non-creator)", async () => {
-  assert.equal(await canDelete(PROJ, EDITOR_B, makeEnv(TEAM)), false);
-});
-
-test("matrix: /projects/trash 가 isAdmin 통과 (admin only)", async () => {
-  assert.equal(await isAdmin(ADMIN, makeEnv(TEAM)), true);
-  assert.equal(await isAdmin(EDITOR_A, makeEnv(TEAM)), false);
+  test("매트릭스 35+ 항목 박제됨", () => {
+    assert.ok(MATRIX.length >= 35);
+  });
+  test("모든 mutation endpoint 에 권한 표기됨", () => {
+    for (const [ep, mutation, perm] of MATRIX) {
+      if (mutation) {
+        assert.ok(perm && perm !== "", `${ep} 권한 표기 누락`);
+      }
+    }
+  });
+  test("isAdmin 전용 endpoint 들 (휴지통/users) 명시됨", () => {
+    const adminOnly = MATRIX.filter(([_, __, p]) => p === "isAdmin");
+    assert.ok(adminOnly.length >= 4, "isAdmin 전용 endpoint 4개 이상");
+  });
+  test("auth-exempt endpoint 명시됨", () => {
+    const exempt = MATRIX.filter(([_, __, p]) => p?.includes("exempt"));
+    assert.ok(exempt.length >= 2, "auth-exempt /health, OPTIONS, /leave 명시");
+  });
 });

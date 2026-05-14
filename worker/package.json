@@ -1,12 +1,14 @@
 {
-  "name": "lab-worker",
-  "type": "module",
+  "name": "ttimes-edit-worker",
+  "version": "2.0.0",
   "private": true,
-  "version": "0.1.0",
-  "description": "lab fresh v2 — Cloudflare Worker (35+ endpoint + merge.js + permissions.js)",
+  "type": "module",
   "scripts": {
-    "test": "node --test __tests__/*.test.js",
-    "deploy": "npx -y wrangler deploy",
-    "tail": "npx -y wrangler tail"
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev",
+    "test": "node --test __tests__/*.test.js"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
   }
 }

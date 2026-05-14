@@ -1,252 +1,158 @@
-// lab fresh v2 — frontend 4중 백업 (D2 + W-1~4)
-// 사료: editor/ops/lab-v2-fresh-2026-05-09.md
-//   - 묶음 ① ½ D2 (4중 백업 + 무제한 보관)
-//   - W-1 통합 백업 키 명명 (te_backup_{type}_{sessionId}_{timestamp})
-//   - W-2 manuscript_replace 5 cap (D2 무제한과 분리)
-//   - W-3 영구 삭제 시 백업 키 정리 (호출자 책임)
-//   - S3.2 D2 — 한글 모달 + JSON 정확 복원
-//
-// 책임:
-//   - createEmergencyBackup (1차 beforeunload + 2차 localStorage 자동)
-//   - downloadBackupAsJSON (3차 사용자 명시 클릭)
-//   - listBackups / restoreFromBackup / deleteBackup
-//   - autoRetry (4차 자동 재시도, 1+2+3초)
-//
-// 4중 백업 카탈로그:
-//   1차 beforeunload 가드 — App.jsx 직접 (본 모듈 무관)
-//   2차 localStorage 자동 — createEmergencyBackup
-//   3차 JSON 다운로드 — downloadBackupAsJSON (사용자 클릭)
-//   4차 자동 재시도 — autoRetry (1+2+3초)
+// CMS v2 — 4중 백업 헬퍼 (D2 사용자 결정 4건 모두 도입)
+// 묶음 ① ½ + ⑨
+// 1차: beforeunload 가드 (App.jsx 직접)
+// 2차: localStorage 자동 (이 모듈)
+// 3차: JSON 다운로드 (이 모듈)
+// 4차: 자동 재시도 (saveDirtyTabsToKV 안에 통합)
 
-const BACKUP_PREFIX = "te_backup_";
-const SCHEMA_VERSION = "2.0";
+const BACKUP_KEY_PREFIX = "te_backup_";
 
-// W-2 — manuscript_replace type 만 5 cap (FIFO). D2 무제한과 분리.
-const MANUSCRIPT_REPLACE_CAP = 5;
+// CMS v2 — N2 (W-2): type 별 보관 정책
+//   - save_failure / conflict / deleted_restore: 무제한 (D2 결정)
+//   - manuscript_replace: 5개 cap (W-2 결정, D2 와 분리)
+const TYPE_CAPS = { manuscript_replace: 5 };
 
-/**
- * Build backup key.
- * Format: te_backup_{type}_{sessionId}_{ISO timestamp}-{nonce}
- *   - type: save_failure | conflict | manuscript_replace | (etc)
- *   - sessionId: project id
- *   - ISO: 2026-05-10T03-32-15-000Z (콜론 → 하이픈, 파일명 호환)
- *   - nonce: 4 random hex chars (★ 같은 ms 충돌 차단)
- */
-function buildBackupKey(type, sessionId, ts) {
-  const isoSafe = String(ts).replace(/[:.]/g, "-");
-  const nonce = Math.floor(Math.random() * 0xFFFF).toString(16).padStart(4, "0");
-  return `${BACKUP_PREFIX}${type}_${sessionId}_${isoSafe}-${nonce}`;
-}
-
-/**
- * Parse backup key.
- */
-function parseBackupKey(key) {
-  if (!key || !key.startsWith(BACKUP_PREFIX)) return null;
-  const rest = key.slice(BACKUP_PREFIX.length);
-  // rest = type_sessionId_timestamp
-  //   - type: 마지막 두 underscore 이전 모두 (save_failure / conflict / manuscript_replace 등)
-  //   - sessionId: 마지막 두 번째 토큰 (^[a-z0-9]{4,24}$)
-  //   - ts: 마지막 토큰 (ISO timestamp, '-' 로 분리)
-  // 안전한 방법: 뒤에서부터 분리 — sessionId 패턴 detect.
-  const parts = rest.split("_");
-  if (parts.length < 3) return null;
-
-  // 뒤에서부터 sessionId 자리 찾기 (마지막 토큰은 ts, 그 직전 토큰이 sessionId)
-  // ts 는 "-" 포함하므로 sessionId 검증으로 식별
-  for (let i = parts.length - 2; i >= 1; i--) {
-    if (/^[a-z0-9]{4,24}$/.test(parts[i])) {
-      const type = parts.slice(0, i).join("_");
-      const sessionId = parts[i];
-      const ts = parts.slice(i + 1).join("_");
-      // sanity: ts 가 ISO 패턴 (YYYY-MM-DD 시작) 인지 추가 검증
-      if (/^\d{4}-\d{2}-\d{2}/.test(ts)) {
-        return { type, sessionId, ts };
-      }
-    }
+function pruneByType(type, maxCount) {
+  const prefix = `${BACKUP_KEY_PREFIX}${type}_`;
+  const keys = [];
+  for (let i = 0; i < localStorage.length; i++) {
+    const k = localStorage.key(i);
+    if (k && k.startsWith(prefix)) keys.push(k);
   }
-  return null;
+  keys.sort(); // 오래된 순 (timestamp 포함 키)
+  while (keys.length >= maxCount) {
+    const oldest = keys.shift();
+    localStorage.removeItem(oldest);
+    console.log(`[backup] cap 초과 정리: ${oldest}`);
+  }
 }
 
 /**
- * Create an emergency backup in localStorage (★ 2차 백업).
- *
- * @param {object} payload - 모든 state (blocks/anal/diffs/hl/exportCache/...)
- * @param {object} opts - { type, sessionId, reason? }
- * @returns {string|null} backup key (or null on failure)
- *
- * W-2: manuscript_replace type 만 5 cap (FIFO).
+ * type ∈ {"save_failure", "conflict", "manuscript_replace", "deleted_restore"}
+ * - 기본: 무제한 보관 (D2)
+ * - manuscript_replace: 5개 cap (FIFO, W-2)
  */
-export function createEmergencyBackup(payload, opts = {}) {
-  const type = opts.type || "save_failure";
-  const sessionId = opts.sessionId || "_unknown";
-  const ts = new Date().toISOString();
-  const key = buildBackupKey(type, sessionId, ts);
+export function createEmergencyBackup({ type, sessionId, fn, tab, payload, reason }) {
+  // CMS v2 — N2: type 별 cap 적용 (cap 있는 type 만)
+  const cap = TYPE_CAPS[type];
+  if (cap) pruneByType(type, cap);
 
+  const ts = new Date().toISOString().replace(/[:.]/g, "-");
+  const key = `${BACKUP_KEY_PREFIX}${type}_${sessionId}_${ts}`;
+  // R3.e — tab 필드 추가 (W2 호환: 옛 backup 은 tab 영역 X, RestoreModal fallback 추론)
   const data = {
-    schemaVersion: SCHEMA_VERSION,
-    backupAt: ts,
     type,
     sessionId,
-    reason: opts.reason || null,
-    payload,
+    fn,
+    tab: tab || null,
+    backupAt: new Date().toISOString(),
+    reason,
+    data: payload,
   };
-
   try {
     localStorage.setItem(key, JSON.stringify(data));
+    return { ok: true, key };
   } catch (e) {
-    // localStorage 가득 참 등 — silent return + console.error
-    console.error(`[backup] localStorage write failed: ${e?.message}`);
-    return null;
-  }
-
-  // W-2 — manuscript_replace 만 cap (FIFO)
-  if (type === "manuscript_replace") {
-    enforceCap(type, sessionId, MANUSCRIPT_REPLACE_CAP);
-  }
-
-  return key;
-}
-
-/**
- * Enforce FIFO cap for a given backup type + sessionId.
- */
-function enforceCap(type, sessionId, cap) {
-  const keys = listBackups()
-    .filter((b) => b.type === type && b.sessionId === sessionId)
-    .sort((a, b) => (a.ts > b.ts ? -1 : 1));  // 최신 우선
-  for (let i = cap; i < keys.length; i++) {
-    deleteBackup(keys[i].key);
+    console.error("[backup] localStorage write failed:", e?.message || e);
+    return { ok: false, error: e?.message || "localStorage full", key };
   }
 }
 
 /**
- * Download backup as JSON file (★ 3차 백업, 사용자 명시 클릭).
- *
- * @param {object} payload
- * @param {string} fileName - 권장 형식: 백업_{프로젝트명}_{YYYY-MM-DD-HH-MM-SS}.json
+ * JSON 파일로 다운로드 (3차 백업 — 사용자 명시 클릭).
+ * 파일명: 백업_{프로젝트명}_{ISO}.json
  */
-export function downloadBackupAsJSON(payload, fileName) {
+export function downloadBackupAsJSON({ sessionId, fn, payload, type = "save_failure" }) {
+  const ts = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
+  const safeName = (fn || "프로젝트").replace(/[\\/:*?"<>|]/g, "_");
+  const filename = `백업_${safeName}_${ts}.json`;
   const data = {
-    schemaVersion: SCHEMA_VERSION,
-    downloadedAt: new Date().toISOString(),
+    type,
+    sessionId,
+    fn,
+    exportedAt: new Date().toISOString(),
+    schemaVersion: "2.0",
     payload,
   };
-  const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+  const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json;charset=utf-8" });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
-  a.download = fileName || `백업_${new Date().toISOString().replace(/[:.]/g, "-")}.json`;
-  document.body.appendChild(a);
+  a.download = filename;
   a.click();
-  document.body.removeChild(a);
-  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  URL.revokeObjectURL(url);
+  return { ok: true, filename };
 }
 
 /**
- * List all backups (sorted desc by ts).
- *
- * @returns {Array<{key, type, sessionId, ts, payload?}>}
+ * 백업 목록 조회 (최신 순).
  */
 export function listBackups() {
-  const out = [];
-  if (typeof localStorage === "undefined") return out;
+  const keys = [];
   for (let i = 0; i < localStorage.length; i++) {
     const k = localStorage.key(i);
-    if (!k || !k.startsWith(BACKUP_PREFIX)) continue;
-    const meta = parseBackupKey(k);
-    if (!meta) continue;
-    out.push({ key: k, ...meta });
+    if (k && k.startsWith(BACKUP_KEY_PREFIX)) keys.push(k);
   }
-  out.sort((a, b) => (a.ts > b.ts ? -1 : 1));
-  return out;
+  return keys.sort().reverse().map((k) => {
+    try {
+      const data = JSON.parse(localStorage.getItem(k));
+      return { key: k, ...data };
+    } catch {
+      return { key: k, error: "parse failed" };
+    }
+  });
 }
 
 /**
- * Read backup payload by key.
- */
-export function restoreFromBackup(key) {
-  if (typeof localStorage === "undefined") return null;
-  const raw = localStorage.getItem(key);
-  if (!raw) return null;
-  try {
-    return JSON.parse(raw);
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Get the latest backup (any type).
+ * 가장 최근 백업 1개 (복원 모달 제안용).
  */
 export function getLatestBackup() {
   const all = listBackups();
-  if (all.length === 0) return null;
-  const latest = all[0];
-  return restoreFromBackup(latest.key);
+  return all.length > 0 ? all[0] : null;
 }
 
 /**
- * Delete a backup (사용자 명시 또는 W-3 영구 삭제 정리).
+ * 백업 삭제 (사용자 명시 호출만).
  */
 export function deleteBackup(key) {
-  if (typeof localStorage === "undefined") return false;
-  try {
-    localStorage.removeItem(key);
-    return true;
-  } catch {
-    return false;
-  }
+  if (!key.startsWith(BACKUP_KEY_PREFIX)) return false;
+  localStorage.removeItem(key);
+  return true;
 }
 
 /**
- * Delete all backups for a sessionId (W-3 — 영구 삭제 시 정리).
+ * 특정 sessionId 의 모든 백업 삭제 (영구 삭제 시 호출 — W3).
  */
 export function deleteBackupsForSession(sessionId) {
-  let count = 0;
-  for (const b of listBackups()) {
+  const all = listBackups();
+  let deleted = 0;
+  for (const b of all) {
     if (b.sessionId === sessionId) {
-      if (deleteBackup(b.key)) count++;
+      localStorage.removeItem(b.key);
+      deleted += 1;
     }
   }
-  return count;
+  return deleted;
 }
 
 /**
- * Auto-retry with exponential backoff (★ 4차 백업).
- *
- * @param {Function} fn - async fn to retry
- * @param {object} opts - { delays?: [1000, 2000, 3000], maxAttempts?: 4 }
- * @returns {Promise<{ok: boolean, value?, error?, attempts}>}
- *
- * 사료 D2: 1+2+3초 (3회), 4회 모두 실패 시 모달 노출.
+ * 자동 재시도 (4차 백업).
+ * @param {Function} fn — 실 저장 호출 (Promise 반환)
+ * @param {number} maxAttempts
+ * @returns {Promise<{ok, attempt, result?, error?}>}
  */
-export async function autoRetry(fn, opts = {}) {
-  const delays = opts.delays || [1000, 2000, 3000];
-  const maxAttempts = opts.maxAttempts || delays.length + 1;
-  let attempts = 0;
-  let lastError;
-
-  for (; attempts < maxAttempts; attempts++) {
+export async function autoRetry(fn, maxAttempts = 3) {
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
-      const value = await fn();
-      return { ok: true, value, attempts: attempts + 1 };
-    } catch (e) {
-      lastError = e;
-      // 재시도 X 케이스 (4xx — 사용자 입력 결함, retry 무의미)
-      if (e?.status && e.status >= 400 && e.status < 500 && e.status !== 429) {
-        return { ok: false, error: e, attempts: attempts + 1 };
+      const result = await fn();
+      return { ok: true, attempt, result };
+    } catch (err) {
+      // 마지막 시도 실패 → throw
+      if (attempt >= maxAttempts) {
+        return { ok: false, attempt, error: err };
       }
-      // 마지막 시도가 아니면 backoff
-      if (attempts < maxAttempts - 1) {
-        await sleep(delays[attempts] || delays[delays.length - 1] || 3000);
-      }
+      // 백오프: 1초, 2초, 3초
+      await new Promise((r) => setTimeout(r, 1000 * attempt));
     }
   }
-
-  return { ok: false, error: lastError, attempts };
-}
-
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
 }

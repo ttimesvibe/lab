@@ -1,28 +1,15 @@
-# 의존성
 node_modules/
-
-# 빌드 결과
 dist/
-docs/dist/
+!docs/dist/
 
-# 환경/비밀
-.env
-.env.local
-.env.*.local
+# KV raw dumps — 업무 내용 포함, 로컬 OneDrive 보관만. 진단 MD/메타데이터는 커밋.
+kv-snapshot/*/s_*.json
+kv-snapshot/*/save_*.json
+kv-snapshot/*/auto_*.json
+kv-snapshot/_build_docs.py.output.txt
+kv-snapshot/*/targets.txt
 
-# KV 백업 (대용량, gitignore 의무)
+# wrangler 로컬 상태
+worker/.wrangler/
 kv-backup-*.json
-
-# 마이그레이션 임시
 anomalies.json
-
-# OS
-.DS_Store
-Thumbs.db
-
-# IDE
-.vscode/
-.idea/
-
-# 로그
-*.log

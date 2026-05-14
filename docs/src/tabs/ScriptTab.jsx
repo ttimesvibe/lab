@@ -1,277 +1,375 @@
-// lab fresh v2 — ScriptTab (★ 사료 §4.2.c 정합 재구현)
+// ═══════════════════════════════════════════════════════════════════════════
+// ScriptTab.jsx — 1.5단계 스크립트 편집 탭 컴포넌트
+// 헌장 v1.1 §5/§6 정식 충족 — TabComponentInterface 따름.
+// ═══════════════════════════════════════════════════════════════════════════
 //
-// 사료 본질 (PRD §4.2.c + §12.1):
-//   UI "스크립트" 탭 = "1차 교정의 단순 텍스트 추출"
-//     - 1차 교정된 본문을 자연스러운 문단으로 통독 (영상 편집 전 참고용 최종 원고)
-//     - 삭제선 자동 적용 (이미 cleanText 기반)
-//     - 사용자가 블록 단위로 추가 편집 가능
-//     - 별도 KV 키 없음 — correction.scriptEdits[block.index] 에 동봉 (dirtyKey: "correction")
+// 책임: 스크립트 편집 화면 본체 (블록 편집 + 통계 + 자막 도구 + 자막 2패널)
+// 데이터: data = { blocks, scriptEdits } (TAB_SCHEMAS.script)
 //
-//   internal "자막" (subtitle) = /subtitle-format LLM 결과 (PRD §4.2.j)
-//     - 영상에 박을 자막 (15-25자 strict 짧은 줄들) — 시청자용
-//     - 사료가 internal 로 분류 — 사용자가 매번 보고 만지는 영역 아님
-//     - 현 lab 에 export 단계 없음 → ScriptTab 하단 details 영역에 internal 의미로 배치
+// 저장 영역:
+//   - setScriptEdits — scriptEdits 갱신 → App.jsx useEffect 가 dirty 마킹
+//   - 다른 setState 는 모두 툴 영역 (저장 X)
+//
+// 툴 영역 (저장 시스템과 명확히 구분):
+//   - handleCopyRaw: clipboard 복사 (저장 X)
+//   - postProcessSubtitle: 자막 후처리 보정 (dead code — V3 에서 Worker 처리)
+//   - handleCopySubtitle: AI 자막 포맷팅 (LLM apiCall + 청크 처리 + 캐시)
+//   - subtitleCache / subtitleResult: 메모리 cache + UI 패널 (저장 X)
+//
+// 결합 영역 (의도된 비즈니스 로직):
+//   - ScriptEditBlock 의 onSave: setScriptEdits (저장) + setSubtitleCache(null) (캐시 무효화)
+//   - 사용자 편집 시 옛 자막 결과 무효 — 의도된 결합. 분리 X.
+//
+// 영역 외 (App.jsx 잔존):
+//   - LLM 호출 인프라 (apiCall / cfg) — props 로 받음
+//   - 자동저장 / dirty 마킹 — App.jsx useEffect (setState 가 자동 트리거)
+//
+// ───────────────────────────────────────────────────────────────────────────
 
-import { useState } from "react";
-import { apiSubtitleFormat } from "../utils/api.js";
+import React from "react";
+import { getCorrectedText } from "../utils/diffRenderer.js";
+import { ScriptEditBlock } from "../components/BlockComponents.jsx";
 
-export function ScriptTab({ tabId, data, allTabData, onSave, onMultiSave, sessionId, config, currentTab, authUser }) {
-  // ★ 통원고 데이터 = correction 의 1차 교정 결과
-  const correction = allTabData?.correction || {};
-  const correctionBlocks = correction.blocks || [];
-  const scriptEdits = correction.scriptEdits || {};  // key=block.index, value=편집된 text
-
-  // ★ 자막 (subtitle) internal data — details 펼침으로만 노출
-  const subtitles = data?.subtitles || [];
-  const subtitleFormat = data?.format || null;
-  const subtitleGeneratedAt = data?._generatedAt || null;
-
-  const [editingBlockIdx, setEditingBlockIdx] = useState(null);
-  const [editText, setEditText] = useState("");
-  const [showSubtitle, setShowSubtitle] = useState(false);
-  const [generating, setGenerating] = useState(false);
-  const [subtitleError, setSubtitleError] = useState("");
-
-  // 블록 별 표시 텍스트 = scriptEdits 우선 (사용자 편집본), fallback = correction.blocks 의 .text
-  function getDisplayText(block) {
-    return (scriptEdits[block.index] !== undefined && scriptEdits[block.index] !== null)
-      ? scriptEdits[block.index]
-      : (block.text || "");
-  }
-
-  function isEdited(block) {
-    return scriptEdits[block.index] !== undefined && scriptEdits[block.index] !== block.text;
-  }
-
-  function handleStartEdit(block) {
-    setEditingBlockIdx(block.index);
-    setEditText(getDisplayText(block));
-  }
-
-  function handleSaveEdit(block) {
-    const trimmed = editText.trim();
-    const orig = block.text || "";
-    const newScriptEdits = { ...scriptEdits };
-    if (trimmed === orig.trim()) {
-      // 원본과 같으면 entry 제거
-      delete newScriptEdits[block.index];
-    } else {
-      newScriptEdits[block.index] = trimmed;
-    }
-    // ★ correction.scriptEdits 동봉 박제 (dirtyKey: "correction", PRD §12.1)
-    if (typeof onMultiSave === "function") {
-      onMultiSave({ correction: { ...correction, scriptEdits: newScriptEdits } });
-    }
-    setEditingBlockIdx(null);
-    setEditText("");
-  }
-
-  function handleCancelEdit() {
-    setEditingBlockIdx(null);
-    setEditText("");
-  }
-
-  function handleRevert(block) {
-    if (!confirm("이 블록의 편집을 취소하고 1차 교정 원본으로 되돌리시겠습니까?")) return;
-    const newScriptEdits = { ...scriptEdits };
-    delete newScriptEdits[block.index];
-    if (typeof onMultiSave === "function") {
-      onMultiSave({ correction: { ...correction, scriptEdits: newScriptEdits } });
-    }
-  }
-
-  // ─── 자막 (internal) 생성 ────────────────────────────────────────────
-  async function handleGenerateSubtitle() {
-    if (generating || correctionBlocks.length === 0) return;
-    setGenerating(true);
-    setSubtitleError("");
-    try {
-      // 사용자 편집 반영된 본문으로 자막 생성
-      const inputText = correctionBlocks
-        .filter((b) => getDisplayText(b).trim().length > 0)
-        .map((b) => `[${b.speaker || "화자"}] ${getDisplayText(b)}`)
-        .join("\n\n");
-
-      const r = await apiSubtitleFormat({ version: "v3", text: inputText }, config);
-      if (!r?.success || typeof r.formatted !== "string") {
-        throw new Error(r?.error || "응답 형식 X");
-      }
-      const lines = r.formatted.split("\n").filter((l) => l.trim().length > 0);
-      const newSubtitles = lines.map((line, i) => ({ index: i, text: line.trim() }));
-      onSave({
-        ...data,
-        subtitles: newSubtitles,
-        format: "v3",
-        _generatedAt: new Date().toISOString(),
-      });
-    } catch (e) {
-      setSubtitleError(e?.message || String(e));
-    } finally {
-      setGenerating(false);
-    }
-  }
-
+export default function ScriptTab({
+  // TabComponentInterface 표준
+  tabId,                  // eslint-disable-line no-unused-vars
+  data,                   // eslint-disable-line no-unused-vars  (R3 시점 사용)
+  onSave,                 // eslint-disable-line no-unused-vars  (setState 가 자동 dirty 마킹)
+  // 데이터
+  blocks,
+  dm,
+  scriptEdits,
+  blockDeletions,
   // 통계
-  const totalBlocks = correctionBlocks.length;
-  const editedCount = Object.keys(scriptEdits).filter((k) => {
-    const b = correctionBlocks.find((bb) => String(bb.index) === String(k));
-    return b && scriptEdits[k] !== b.text;
-  }).length;
-  const totalChars = correctionBlocks.reduce((s, b) => s + getDisplayText(b).length, 0);
+  fC, tC, sC,
+  // 헬퍼
+  applyDeletions,
+  // setters
+  setScriptEdits,
+  // 자막 도구 영역
+  subtitleCache,
+  subtitleResult,
+  setSubtitleCache,
+  setSubtitleResult,
+  // API
+  apiCall,
+  cfg,
+  // 테마
+  C, FN,
+}) {
+  const editedCount = Object.keys(scriptEdits).length;
 
-  return (
-    <div className="tab tab-script">
-      <h2 style={{ margin: "0 0 12px 0" }}>스크립트 — 1차 교정 통원고</h2>
-      <div style={{ fontSize: 12, color: "#666", marginBottom: 12 }}>
-        ★ 1차 교정된 본문을 통독하며 자유롭게 다듬는 영역. 블록 클릭으로 인라인 편집.
-        사용자 편집은 <code>correction.scriptEdits</code> 에 동봉 저장 (별도 KV 키 X).
+  // 원본 텍스트 복사 (포맷팅 없이)
+  const handleCopyRaw = (e) => {
+    const lines = blocks.map(b => {
+      const idx = b.index;
+      let t = scriptEdits[idx] !== undefined ? scriptEdits[idx] : getCorrectedText(b.text, dm[idx]);
+      t = applyDeletions(t, blockDeletions[idx]);
+      return t;
+    });
+    const text = lines.join("\n\n");
+    try { navigator.clipboard.writeText(text); } catch {
+      const ta = document.createElement("textarea");
+      ta.value = text; ta.style.cssText = "position:fixed;left:-9999px";
+      document.body.appendChild(ta); ta.select(); document.execCommand("copy"); document.body.removeChild(ta);
+    }
+    const btn = e.currentTarget;
+    btn.textContent = "✅ 복사됨!";
+    setTimeout(() => { btn.textContent = "📋 원본 복사"; }, 1500);
+  };
+
+  // AI 자막 포맷팅 복사
+  // ── 후처리 보정: AI 출력의 형식 오류를 코드로 강제 교정 ──
+  // 주: V3 부터 Worker 후처리 완료 — 본 함수는 dead code (사용 X). 호환 보존.
+  // eslint-disable-next-line no-unused-vars
+  const postProcessSubtitle = (text) => {
+    let lines = text.split('\n');
+
+    // 1) 메타 정보 / 구분선 제거
+    const isMetaLine = (t, lineIdx) => {
+      if (!t) return false;
+      // 구분선: 대시/등호 3개 이상 포함
+      if (/[-=]{3,}/.test(t)) return true;
+      // 파일명 패턴: "260327_박종천 싱크" 등
+      if (/^\d{6}[_\s]/.test(t)) return true;
+      // 날짜+시간 패턴
+      if (/^\d{4}\.\d{2}\.\d{2}\s/.test(t)) return true;
+      // 분초 패턴
+      if (/\d+분\s*\d+초/.test(t) && t.length < 40) return true;
+      // 편/장 구분
+      if (/^\d+편(\/\d+편)?$/.test(t)) return true;
+      // 싱크/녹취 헤더
+      if (/싱크|녹취록|Sync/i.test(t) && t.length < 30) return true;
+      // 이름 나열: 텍스트 앞부분(처음 10줄)에서만, 2~5어절 한글/영문, 구두점 없음
+      if (lineIdx < 10 && /^[가-힣a-zA-Z]+(\s[가-힣a-zA-Z]+){1,4}$/.test(t) && t.length < 25 && !/[.?!,]/.test(t)) return true;
+      return false;
+    };
+    lines = lines.filter((l, i) => {
+      const t = l.trim();
+      if (!t) return true; // 빈 줄 유지
+      return !isMetaLine(t, i);
+    });
+
+    // 2) 줄 끝 구두점 제거 (마침표, 쉼표) — 물음표/느낌표는 유지
+    lines = lines.map(l => {
+      let s = l.trimEnd();
+      while (s.endsWith('.') || s.endsWith(',')) {
+        s = s.slice(0, -1).trimEnd();
+      }
+      return s;
+    });
+
+    // 3) [제거됨] 짧은 줄 합치기는 문장 경계를 무시할 수 있어 제거
+
+    // 4) 따옴표 보정 — 줄바꿈된 따옴표 구간에 각 줄마다 따옴표 적용
+    const fixQuotes = (lines, q) => {
+      const result = [];
+      let inQuote = false;
+      let quoteChar = q;
+      for (let i = 0; i < lines.length; i++) {
+        let l = lines[i];
+        if (!l.trim()) { result.push(l); inQuote = false; continue; }
+
+        const opens = (l.match(new RegExp('\\' + quoteChar, 'g')) || []).length;
+        const hasOpen = l.includes(quoteChar);
+
+        if (!inQuote && hasOpen && opens % 2 === 1) {
+          // 따옴표 열림 — 닫히지 않은 상태
+          // 열린 따옴표 위치 찾기
+          const qIdx = l.indexOf(quoteChar);
+          const afterQ = l.substring(qIdx);
+          if ((afterQ.match(new RegExp('\\' + quoteChar, 'g')) || []).length === 1) {
+            // 이 줄에서 열리고 닫히지 않음
+            inQuote = true;
+            // 줄 끝에 닫는 따옴표 추가
+            l = l.trimEnd() + quoteChar;
+          }
+        } else if (inQuote) {
+          // 따옴표 안에 있는 줄
+          if (hasOpen && opens % 2 === 1) {
+            // 닫는 따옴표가 있음 → 따옴표 구간 종료
+            // 줄 시작에 여는 따옴표가 없으면 추가
+            if (!l.trimStart().startsWith(quoteChar)) {
+              l = quoteChar + l.trimStart();
+            }
+            inQuote = false;
+          } else {
+            // 중간 줄 — 양쪽에 따옴표 추가
+            const trimmed = l.trim();
+            if (!trimmed.startsWith(quoteChar)) l = quoteChar + trimmed;
+            if (!l.trimEnd().endsWith(quoteChar)) l = l.trimEnd() + quoteChar;
+          }
+        }
+        result.push(l);
+      }
+      return result;
+    };
+
+    let processed = fixQuotes(lines, "'");
+    processed = fixQuotes(processed, '"');
+
+    return processed.join('\n');
+  };
+
+  const handleCopySubtitle = async (e) => {
+    const btn = e.currentTarget;
+    const origBtnText = btn.textContent;
+
+    // 캐시가 있으면 2패널 표시 (이미 결과가 있으면 바로 보여줌)
+    if (subtitleCache) {
+      setSubtitleResult(subtitleCache);
+      return;
+    }
+
+    btn.textContent = "⏳ AI 포맷팅 중 (0%)...";
+    btn.style.opacity = "0.7";
+    btn.disabled = true;
+    try {
+      const allTexts = blocks.map(b => {
+        const idx = b.index;
+        let text = scriptEdits[idx] !== undefined
+          ? scriptEdits[idx]
+          : getCorrectedText(b.text, dm[idx]);
+        text = applyDeletions(text, blockDeletions[idx]);
+        const speaker = b.speaker && b.speaker !== "—" ? `[${b.speaker}]` : "";
+        return speaker ? `${speaker}\n${text}` : text;
+      });
+
+      // PATCH-008: 600~1000자 범위 + 화자 턴 경계에서 끊기
+      const CHUNK_MIN = 600;
+      const CHUNK_MAX = 1000;
+      const SENTENCE_END = /(?<=[.?!요죠다까])\s+/;
+      const isMetaBlock = (text) => {
+        const t = text.trim();
+        if (!t) return true;
+        if (/^\d{6}[_\s]/.test(t)) return true;
+        if (/^\d{4}\.\d{2}\.\d{2}/.test(t)) return true;
+        if (/^\d+분\s*\d+초/.test(t)) return true;
+        if (/^[-=─]{3,}$/.test(t)) return true;
+        if (/^={5,}/.test(t)) return true;
+        return false;
+      };
+      const chunks = [];
+      let currentChunk = "";
+      for (const blockText of allTexts) {
+        if (!blockText.trim()) continue;
+        if (isMetaBlock(blockText)) continue;
+
+        const wouldBe = currentChunk.length + (currentChunk ? 1 : 0) + blockText.length;
+
+        if (currentChunk.length >= CHUNK_MIN && wouldBe > CHUNK_MAX) {
+          chunks.push(currentChunk);
+          currentChunk = blockText;
+        } else if (wouldBe > CHUNK_MAX && currentChunk.length < CHUNK_MIN) {
+          if (currentChunk) chunks.push(currentChunk);
+          if (blockText.length > CHUNK_MAX) {
+            const sentences = blockText.split(SENTENCE_END);
+            let partial = "";
+            for (const sent of sentences) {
+              if (partial.length + sent.length + 1 > CHUNK_MAX && partial.length > 0) {
+                chunks.push(partial);
+                partial = sent;
+              } else {
+                partial += (partial ? ' ' : '') + sent;
+              }
+            }
+            currentChunk = partial || "";
+          } else {
+            currentChunk = blockText;
+          }
+        } else {
+          currentChunk += (currentChunk ? '\n' : '') + blockText;
+        }
+      }
+      if (currentChunk) chunks.push(currentChunk);
+
+      // 검증 함수
+      const validateAndUse = (d, originalChunk) => {
+        if (!d || !d.formatted) return originalChunk;
+        if (d._debug?.truncated) {
+          console.warn(`[자막] 축약 감지 (${d._debug.ratio}%) — 원본 사용`);
+          return originalChunk;
+        }
+        return d.formatted;
+      };
+
+      const PARALLEL = 3;
+      const formattedChunks = new Array(chunks.length);
+
+      // Warmup: 첫 블록 순차 호출 → prompt cache 생성
+      console.log(`[자막 V3] ${chunks.length}개 블록 처리 시작`);
+      const first = await apiCall("subtitle-format", { text: chunks[0], version: "v3" }, cfg);
+      if (first._debug) console.log(`[자막 DEBUG] chunk 0:`, first._debug);
+      formattedChunks[0] = validateAndUse(first, chunks[0]);
+
+      // 나머지: PARALLEL개씩 병렬 호출 → cache hit
+      for (let i = 1; i < chunks.length; i += PARALLEL) {
+        const pct = Math.round((i / chunks.length) * 100);
+        btn.textContent = `⏳ AI 포맷팅 중 (${pct}%)...`;
+
+        const batch = chunks.slice(i, i + PARALLEL);
+        const promises = batch.map((chunk, j) =>
+          apiCall("subtitle-format", { text: chunk, version: "v3" }, cfg)
+            .then(d => ({ idx: i + j, d, chunk }))
+            .catch(err => ({ idx: i + j, d: null, chunk, err }))
+        );
+
+        const results = await Promise.all(promises);
+        for (const { idx, d, chunk } of results) {
+          if (d?._debug) console.log(`[자막 DEBUG] chunk ${idx}:`, d._debug);
+          formattedChunks[idx] = validateAndUse(d, chunk);
+        }
+      }
+
+      // V3: Worker 후처리 완료 — 프론트 후처리 스킵
+      const finalText = formattedChunks.join('\n');
+
+      setSubtitleCache(finalText);
+      setSubtitleResult(finalText);
+
+      btn.textContent = origBtnText;
+      btn.style.opacity = "1";
+    } catch (err) {
+      btn.textContent = "❌ 실패";
+      console.error("자막 포맷팅 실패:", err);
+      setTimeout(() => { btn.textContent = origBtnText; btn.style.opacity = "1"; }, 2000);
+    } finally {
+      btn.disabled = false;
+    }
+  };
+
+  return <div style={{display:"flex",flex:1,overflow:"hidden"}}>
+    <div style={{flex:1,display:"flex",flexDirection:"column",overflow:"hidden"}}>
+    <div style={{flex:1,overflowY:"auto",padding:0}}>
+      <div style={{padding:"8px 16px",fontSize:11,fontWeight:700,color:C.txD,textTransform:"uppercase",
+        letterSpacing:"0.08em",borderBottom:`1px solid ${C.bd}`,position:"sticky",top:0,background:C.bg,zIndex:2,
+        display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+        <span>최종 스크립트 편집</span>
+        <span style={{fontSize:11,color:C.txM,fontWeight:400,textTransform:"none",letterSpacing:0}}>
+          블록을 클릭하면 편집할 수 있습니다{editedCount > 0 ? ` · 수동 수정 ${editedCount}건` : ""}
+        </span>
       </div>
-
-      {/* 통계 카드 */}
-      <div style={{ display: "flex", gap: 12, marginBottom: 16, flexWrap: "wrap" }}>
-        <div style={{ flex: 1, minWidth: 140, padding: 10, background: "#f0f4ff", borderRadius: 6 }}>
-          <div style={{ fontSize: 10, fontWeight: 700, color: "#345", marginBottom: 4 }}>📦 블록</div>
-          <div style={{ fontSize: 18, fontWeight: 700, color: "#234" }}>{totalBlocks}</div>
-        </div>
-        <div style={{ flex: 1, minWidth: 140, padding: 10, background: editedCount > 0 ? "#fef3c7" : "#fafafa", borderRadius: 6 }}>
-          <div style={{ fontSize: 10, fontWeight: 700, color: editedCount > 0 ? "#78350f" : "#666", marginBottom: 4 }}>✏️ 편집된 블록</div>
-          <div style={{ fontSize: 18, fontWeight: 700, color: editedCount > 0 ? "#92400e" : "#666" }}>{editedCount}</div>
-        </div>
-        <div style={{ flex: 1, minWidth: 140, padding: 10, background: "#fafafa", borderRadius: 6 }}>
-          <div style={{ fontSize: 10, fontWeight: 700, color: "#666", marginBottom: 4 }}>📝 전체 분량</div>
-          <div style={{ fontSize: 18, fontWeight: 700, color: "#222" }}>{totalChars.toLocaleString()} 자</div>
-        </div>
-      </div>
-
-      {/* 통원고 — 자연스러운 문단 통독 + 인라인 편집 */}
-      {correctionBlocks.length === 0 ? (
-        <div style={{ padding: 16, background: "#f7f7f7", borderRadius: 4, color: "#666" }}>
-          1차 교정 먼저 완료하세요. (0차 검토 → 사전 분석 → 1차 교정 시작)
-        </div>
-      ) : (
-        <div style={{ borderTop: "1px solid #eee", paddingTop: 12 }}>
-          <div style={{ maxHeight: "60vh", overflowY: "auto", fontSize: 14, lineHeight: 1.7 }}>
-            {correctionBlocks.map((b) => {
-              const isEditing = editingBlockIdx === b.index;
-              const edited = isEdited(b);
-              const displayText = getDisplayText(b);
-              return (
-                <div
-                  key={b.index}
-                  style={{
-                    marginBottom: 10,
-                    padding: 10,
-                    background: isEditing ? "#fffbeb" : edited ? "#fef3c7" : "#fff",
-                    border: isEditing ? "2px solid #f59e0b" : edited ? "1px solid #fde68a" : "1px solid #eee",
-                    borderRadius: 4,
-                  }}
-                >
-                  <div style={{ fontSize: 11, color: "#666", marginBottom: 4, display: "flex", justifyContent: "space-between" }}>
-                    <span>
-                      [{b.index}] {b.speaker} {b.timestamp}
-                      {edited && <span style={{ marginLeft: 6, padding: "1px 6px", background: "#f59e0b", color: "#fff", borderRadius: 3, fontSize: 10 }}>✏️ 편집됨</span>}
-                    </span>
-                    {!isEditing && (
-                      <span style={{ display: "flex", gap: 4 }}>
-                        <button onClick={() => handleStartEdit(b)} style={{ padding: "2px 8px", border: "1px solid #ccc", background: "#fff", borderRadius: 3, cursor: "pointer", fontSize: 11 }}>편집</button>
-                        {edited && (
-                          <button onClick={() => handleRevert(b)} style={{ padding: "2px 8px", border: "1px solid #ef4444", color: "#ef4444", background: "#fff", borderRadius: 3, cursor: "pointer", fontSize: 11 }}>되돌리기</button>
-                        )}
-                      </span>
-                    )}
-                  </div>
-                  {isEditing ? (
-                    <div>
-                      <textarea
-                        value={editText}
-                        onChange={(e) => setEditText(e.target.value)}
-                        autoFocus
-                        rows={Math.max(3, Math.ceil(editText.length / 70))}
-                        style={{ width: "100%", padding: 8, border: "1px solid #f59e0b", borderRadius: 3, fontSize: 14, lineHeight: 1.6, fontFamily: "inherit", boxSizing: "border-box", resize: "vertical" }}
-                        onKeyDown={(e) => {
-                          if (e.key === "Escape") handleCancelEdit();
-                          if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) handleSaveEdit(b);
-                        }}
-                      />
-                      <div style={{ marginTop: 4, display: "flex", gap: 4, justifyContent: "flex-end" }}>
-                        <span style={{ fontSize: 11, color: "#666", alignSelf: "center", marginRight: 8 }}>Ctrl+Enter 저장 · Esc 취소</span>
-                        <button onClick={() => handleSaveEdit(b)} style={{ padding: "4px 12px", border: "none", background: "#3b82f6", color: "#fff", borderRadius: 3, cursor: "pointer", fontSize: 12 }}>저장</button>
-                        <button onClick={handleCancelEdit} style={{ padding: "4px 12px", border: "1px solid #ccc", background: "#fff", borderRadius: 3, cursor: "pointer", fontSize: 12 }}>취소</button>
-                      </div>
-                    </div>
-                  ) : (
-                    <div style={{ whiteSpace: "pre-wrap", wordBreak: "keep-all", color: "#222" }}>
-                      {displayText}
-                    </div>
-                  )}
-                </div>
-              );
-            })}
-          </div>
-        </div>
-      )}
-
-      {/* ★ 자막 (subtitle) — internal 영역 (사료 §4.2.j) — details 펼침으로만 노출 */}
-      <details style={{ marginTop: 20, padding: 12, background: "#f9fafb", borderRadius: 6 }} open={showSubtitle}>
-        <summary
-          onClick={(e) => { e.preventDefault(); setShowSubtitle(!showSubtitle); }}
-          style={{ cursor: "pointer", fontSize: 12, fontWeight: 700, color: "#666", textTransform: "uppercase", letterSpacing: "0.05em" }}
-        >
-          ★ 자막 포맷팅 (internal — /subtitle-format) — {showSubtitle ? "접기" : "펼치기"}
-        </summary>
-        <div style={{ marginTop: 10, fontSize: 12, color: "#666" }}>
-          사료 §4.2.j: 자막은 internal 산출물. 영상 export 시점에 SRT 등으로 사용. 현재는 미리보기만.
-        </div>
-        <div style={{ marginTop: 8, display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}>
-          <div style={{ fontSize: 12, color: "#444" }}>
-            {subtitles.length > 0
-              ? `자막 ${subtitles.length} 라인 (format: ${subtitleFormat}${subtitleGeneratedAt ? ` · ${new Date(subtitleGeneratedAt).toLocaleString("ko-KR")}` : ""})`
-              : "자막 미생성"}
-          </div>
-          <button
-            onClick={handleGenerateSubtitle}
-            disabled={generating || correctionBlocks.length === 0}
-            style={{
-              padding: "6px 14px", border: "none", borderRadius: 4,
-              background: generating || correctionBlocks.length === 0 ? "#bbb" : "#06b6d4",
-              color: "#fff", fontSize: 12, fontWeight: 600,
-              cursor: generating || correctionBlocks.length === 0 ? "not-allowed" : "pointer",
-            }}
-          >
-            {generating ? "생성 중... (30-90초)" : subtitles.length > 0 ? "자막 재생성" : "자막 생성 (V3)"}
-          </button>
-        </div>
-        {subtitleError && (
-          <div style={{ marginTop: 8, padding: 8, background: "#fee2e2", borderRadius: 4, color: "#991b1b", fontSize: 12 }}>
-            ❌ {subtitleError}
-          </div>
-        )}
-        {subtitles.length > 0 && (
-          <div style={{ marginTop: 10, maxHeight: "30vh", overflowY: "auto", fontSize: 13, lineHeight: 1.6 }}>
-            {subtitles.map((s) => {
-              const len = (s.text || "").length;
-              const violation = len > 25 || len < 10;
-              return (
-                <div
-                  key={s.index}
-                  style={{
-                    padding: "5px 10px",
-                    marginBottom: 2,
-                    background: violation ? "#fef3c7" : "#fff",
-                    borderLeft: violation ? "3px solid #f59e0b" : "3px solid #e5e7eb",
-                    borderRadius: 2,
-                    display: "flex",
-                    justifyContent: "space-between",
-                  }}
-                >
-                  <span style={{ wordBreak: "keep-all" }}>{s.text}</span>
-                  <span style={{ fontSize: 11, color: violation ? "#b45309" : "#999", marginLeft: 12, flexShrink: 0 }}>{len}자</span>
-                </div>
-              );
-            })}
-          </div>
-        )}
-      </details>
+      {blocks.map(b => {
+        const idx = b.index;
+        const corrected = getCorrectedText(b.text, dm[idx]);
+        const editedVal = scriptEdits[idx];
+        const isEdited = editedVal !== undefined && editedVal !== corrected;
+        return <ScriptEditBlock key={idx} block={b} correctedText={corrected}
+          editedVal={editedVal} isEdited={isEdited}
+          deletions={blockDeletions[idx]}
+          onSave={val => {
+            if (val !== null) setScriptEdits(prev=>({...prev,[idx]:val}));
+            else setScriptEdits(prev=>{const n={...prev};delete n[idx];return n;});
+            setSubtitleCache(null); setSubtitleResult(null);
+          }}
+          onRevert={() => { setScriptEdits(prev=>{const n={...prev};delete n[idx];return n;}); setSubtitleCache(null); setSubtitleResult(null); }}
+        />;
+      })}
     </div>
-  );
+    <div style={{display:"flex",gap:12,padding:"10px 20px",background:C.sf,borderTop:`1px solid ${C.bd}`,
+      fontSize:13,color:C.txM,flexShrink:0,alignItems:"center"}}>
+      <span>블록: <b style={{color:C.tx}}>{blocks.length}</b></span>
+      {editedCount > 0 && <span>수동 수정: <b style={{color:"#22C55E"}}>{editedCount}</b></span>}
+      <span>AI 교정: <b style={{color:C.cTx}}>{fC+tC+sC}</b></span>
+      <button onClick={handleCopyRaw}
+        style={{marginLeft:"auto",padding:"7px 16px",borderRadius:8,border:`1px solid ${C.bd}`,
+          background:"transparent",color:C.txM,fontSize:12,fontWeight:600,
+          cursor:"pointer"}}>
+        📋 원본 복사
+      </button>
+      <button onClick={handleCopySubtitle}
+        style={{padding:"7px 20px",borderRadius:8,border:"none",
+          background:`linear-gradient(135deg,${C.ac},#7C3AED)`,color:"#fff",fontSize:13,fontWeight:700,
+          cursor:"pointer",boxShadow:"0 3px 12px rgba(74,108,247,0.3)",
+          display:"flex",alignItems:"center",gap:6}}>
+        🎬 자막용 복사
+      </button>
+    </div>
+    </div>
+    {/* 자막 2패널 — 우측 */}
+    {subtitleResult && <div style={{width:420,minWidth:420,borderLeft:`1px solid ${C.bd}`,
+      display:"flex",flexDirection:"column",background:"rgba(0,0,0,0.08)"}}>
+      <div style={{padding:"8px 14px",fontSize:11,fontWeight:700,color:C.txD,textTransform:"uppercase",
+        letterSpacing:"0.08em",borderBottom:`1px solid ${C.bd}`,display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+        <span>자막 포맷팅 결과</span>
+        <div style={{display:"flex",gap:6}}>
+          <button onClick={async()=>{
+            try { await navigator.clipboard.writeText(subtitleResult); } catch {
+              const ta = document.createElement("textarea");
+              ta.value = subtitleResult; ta.style.cssText = "position:fixed;left:-9999px";
+              document.body.appendChild(ta); ta.select(); document.execCommand("copy"); document.body.removeChild(ta);
+            }
+          }} style={{fontSize:10,fontWeight:600,padding:"3px 10px",borderRadius:4,border:`1px solid ${C.bd}`,
+            background:"rgba(255,255,255,0.06)",color:C.txM,cursor:"pointer"}}>📋 복사</button>
+          <button onClick={()=>setSubtitleResult(null)}
+            style={{fontSize:10,fontWeight:600,padding:"3px 8px",borderRadius:4,border:`1px solid ${C.bd}`,
+              background:"rgba(255,255,255,0.06)",color:C.txD,cursor:"pointer"}}>✕ 닫기</button>
+        </div>
+      </div>
+      <div style={{flex:1,overflowY:"auto",padding:"12px 16px"}}>
+        <pre style={{fontSize:13,color:C.tx,lineHeight:1.7,whiteSpace:"pre-wrap",wordBreak:"break-word",
+          fontFamily:FN,margin:0}}>{subtitleResult}</pre>
+      </div>
+    </div>}
+  </div>;
 }
