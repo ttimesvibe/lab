@@ -41,7 +41,7 @@ export const TAB_SCHEMAS = Object.freeze({
     required: [],
   },
   visual: {
-    fields: ["visualGuides", "insertCuts", "manualResources", "verdicts", "visualMarkers"],
+    fields: ["visualGuides", "insertCuts", "manualResources", "verdicts", "visualMarkers", "_visualsGeneratedAt", "_cutsGeneratedAt"],
     required: [],
   },
   modify: {
