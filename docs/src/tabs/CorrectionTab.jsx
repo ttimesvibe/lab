@@ -52,8 +52,9 @@ export function CorrectionTab({ tabId, data, onSave, onMultiSave, sessionId, con
     try {
       // ★ 빈 텍스트 블록 제외 (strike 전체였던 블록은 .index 보존을 위해 빈 텍스트로 박혀있음)
       const blocksForLLM = blocks.filter((b) => b.text && b.text.trim().length > 0);
-      // ★ splitChunks: 15K 자 청크 + 2 블록 context overlap
-      const chunks = splitChunks(blocksForLLM, 15000);
+      // ★ splitChunks: 8K 자 청크 + 2 블록 context overlap
+      // (이전 15K — gpt-4o-mini 응답이 timeout 초과 사례 → 8K 로 축소, 호출 횟수는 늘지만 각각 빨라짐)
+      const chunks = splitChunks(blocksForLLM, 8000);
       setProgress({ done: 0, total: chunks.length });
 
       const allDiffs = [];
