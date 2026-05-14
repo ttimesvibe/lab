@@ -507,7 +507,9 @@ function AuthenticatedApp({ authUser, onLogout, initialSessionId, onBackToDashbo
         patchTab(tabId, pickFields(tabId, data), { markDirty: false });
         if (data.savedAt) lastLoadedAt.current[tabId] = data.savedAt;
         if (data.version !== undefined) lastLoadedVersion.current[tabId] = data.version;
-        console.log(`[r3-diag] tabFresh loaded: ${tabId} keys=[${Object.keys(data).join(",")}]`);
+        const sz = tabId === "correction" ? `blocks=${data?.blocks?.length} diffs=${data?.diffs?.length} anal=${data?.anal ? "Y" : "N"}` :
+                   tabId === "guide" ? `hl=${data?.hl?.length}` : "";
+        console.log(`[r3-diag] tabFresh loaded: ${tabId} keys=[${Object.keys(data).join(",")}] ${sz}`);
       }
     }).catch(e => {
       console.warn(`[r3-diag] tabFresh failed: ${tabId} — ${e?.message || e}`);
@@ -726,7 +728,7 @@ function AuthenticatedApp({ authUser, onLogout, initialSessionId, onBackToDashbo
                 const keys = v ? Object.keys(v).join(",") : "null";
                 const sz = tabs[i] === "modify" ? `cards=${v?.cards?.length}` :
                            tabs[i] === "guide" ? `hl=${v?.hl?.length}` :
-                           tabs[i] === "correction" ? `blocks=${v?.blocks?.length}` :
+                           tabs[i] === "correction" ? `blocks=${v?.blocks?.length} diffs=${v?.diffs?.length} anal=${v?.anal ? "Y" : "N"}` :
                            tabs[i] === "highlight" ? `clips=${v?.clips?.length}` :
                            tabs[i] === "visual" ? `guides=${v?.visualGuides?.length}` : "";
                 console.log(`[r3-diag] load LOADED ${tabs[i]}: keys=[${keys}] ${sz}`);
