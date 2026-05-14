@@ -24,8 +24,11 @@ export const TAB_MAP = Object.freeze({
   manuscript: { worker: "manuscript", ui: "manuscript", step: null, dirtyKey: "manuscript", persist: true,  internal: false },
   review:     { worker: "review",     ui: "review",     step: 0,    dirtyKey: "review",     persist: true,  internal: false },
   correction: { worker: "correction", ui: "correction", step: 1,    dirtyKey: "correction", persist: true,  internal: false },
-  // ★ subtitle worker 키 = /subtitle-format LLM 결과. UI "script" 탭은 correction.scriptEdits 동봉.
-  subtitle:   { worker: "subtitle",   ui: "script",     step: 2,    dirtyKey: "subtitle",   persist: true,  internal: false },
+  // ★ PRD §12.1 정합:
+  //   - worker "subtitle" 키 (s:<id>:subtitle) = /subtitle-format LLM 결과 (internal)
+  //   - UI "script" 탭 = 1차 교정 텍스트 추출 + 사용자 편집 (correction.scriptEdits 동봉)
+  //   - dirtyKey: "correction" — UI script 의 사용자 액션은 correction 을 dirty 마크 (별도 KV 키 X)
+  subtitle:   { worker: "subtitle",   ui: "script",     step: 2,    dirtyKey: "correction", persist: true,  internal: true },
   guide:      { worker: "guide",      ui: "guide",      step: 3,    dirtyKey: "guide",      persist: true,  internal: false },
   visual:     { worker: "visual",     ui: "visual",     step: 4,    dirtyKey: "visual",     persist: true,  internal: false },
   modify:     { worker: "modify",     ui: "modify",     step: 5,    dirtyKey: "modify",     persist: true,  internal: false },

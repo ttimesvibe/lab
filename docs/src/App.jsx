@@ -537,7 +537,8 @@ function TabBar({ uiTabs, currentUiTab, onChange }) {
             cursor: "pointer",
           }}
         >
-          {tabLabelKo(workerToUi(t) ? t : (uiToWorker(t) || t))}
+          {/* ★ UI key 의 한글 라벨 직접 표시 (script → "스크립트", 사료 §4.2.c 정합) */}
+          {tabLabelKo(t)}
         </button>
       ))}
     </nav>
