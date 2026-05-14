@@ -999,7 +999,7 @@ function AuthenticatedApp({ authUser, onLogout, initialSessionId, onBackToDashbo
       const keys = d ? Object.keys(d).join(",") : "null";
       const sizeHint = t === "modify" ? `cards=${d?.cards?.length}` :
                        t === "guide" ? `hl=${d?.hl?.length}` :
-                       t === "correction" ? `blocks=${d?.blocks?.length}` :
+                       t === "correction" ? `blocks=${d?.blocks?.length} diffs=${d?.diffs?.length} anal=${d?.anal ? "Y" : "N"}` :
                        t === "highlight" ? `clips=${d?.clips?.length}` :
                        t === "visual" ? `guides=${d?.visualGuides?.length}` : "";
       console.log(`[r3-diag] save PAYLOAD ${t}: keys=[${keys}] ${sizeHint}`);
