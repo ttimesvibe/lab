@@ -1890,8 +1890,7 @@ async function handleDictPost(body, env, headers) {
 // ═══════════════════════════════════════
 
 async function callOpenAI(systemPrompt, userMessage, env, options = {}) {
-  // ★ 2026-05-11 사용자 명시: lab(test) default = gpt-5.4 (1,2,3,4 endpoint 영역)
-  const { temperature = 0.1, max_tokens = 16000, model = "gpt-5.4", useJsonFormat = true } = options;
+  const { temperature = 0.1, max_tokens = 16000, model = "gpt-5.1", useJsonFormat = true } = options;
 
   const reqBody = {
     model,
@@ -3003,7 +3002,7 @@ async function validateAndResplit(lines, env) {
           method: "POST",
           headers: { "Content-Type": "application/json", "Authorization": `Bearer ${env.OPENAI_API_KEY}` },
           body: JSON.stringify({
-            model: "gpt-5.4",
+            model: "gpt-5.4-mini",
             messages: [
               { role: "system", content: SUBTITLE_FORMAT_PROMPT },
               { role: "user", content: numbered },
@@ -3271,7 +3270,7 @@ async function resplitLongLines(lines, env) {
         method: "POST",
         headers: { "Content-Type": "application/json", "Authorization": `Bearer ${env.OPENAI_API_KEY}` },
         body: JSON.stringify({
-          model: "gpt-5.4",
+          model: "gpt-5.4-mini",
           messages: [
             { role: "system", content: SUBTITLE_FORMAT_PROMPT_V3 },
             { role: "user", content: line },
@@ -3359,7 +3358,7 @@ async function handleSubtitleFormat(body, env, headers) {
         method: "POST",
         headers: { "Content-Type": "application/json", "Authorization": `Bearer ${env.OPENAI_API_KEY}` },
         body: JSON.stringify({
-          model: "gpt-5.4",
+          model: "gpt-5.4-mini",
           messages: [
             { role: "system", content: SUBTITLE_FORMAT_PROMPT_V3 },
             { role: "user", content: inputText },
@@ -3434,7 +3433,7 @@ async function handleSubtitleFormat(body, env, headers) {
         method: "POST",
         headers: { "Content-Type": "application/json", "Authorization": `Bearer ${env.OPENAI_API_KEY}` },
         body: JSON.stringify({
-          model: "gpt-5.4",
+          model: "gpt-5.4-mini",
           messages: [
             { role: "system", content: SUBTITLE_FORMAT_PROMPT },
             { role: "user", content: numbered },
@@ -3455,7 +3454,7 @@ async function handleSubtitleFormat(body, env, headers) {
           method: "POST",
           headers: { "Content-Type": "application/json", "Authorization": `Bearer ${env.OPENAI_API_KEY}` },
           body: JSON.stringify({
-            model: "gpt-5.4",
+            model: "gpt-5.4-mini",
             messages: [
               { role: "system", content: SUBTITLE_FORMAT_PROMPT },
               { role: "user", content: numbered },
@@ -3547,7 +3546,7 @@ async function handleSubtitleFormat(body, env, headers) {
         method: "POST",
         headers: { "Content-Type": "application/json", "Authorization": `Bearer ${env.OPENAI_API_KEY}` },
         body: JSON.stringify({
-          model: "gpt-5.4",
+          model: "gpt-5.4-mini",
           messages: [{ role: "system", content: SUBTITLE_FORMAT_PROMPT }, { role: "user", content: chunk.numbered }],
           temperature: 0.1, max_completion_tokens: 2000, response_format: { type: "json_object" },
         }),
@@ -3641,8 +3640,7 @@ async function handleTermExplain(body, env, headers) {
     return new Response(JSON.stringify({ error: "All AI providers failed (Gemini unavailable, OpenAI key missing)" }), { status: 502, headers });
   }
   try {
-    // ★ 2026-05-11: term-explain 폴백 model gpt-4.1-mini → gpt-5.1 (사용자 명시 #6)
-    const result = await callOpenAI(systemPrompt, userMessage, env, { model: "gpt-5.1", temperature: 0.3, max_tokens: 2000 });
+    const result = await callOpenAI(systemPrompt, userMessage, env, { model: "gpt-4.1-mini", temperature: 0.3, max_tokens: 2000 });
     if (result.error) {
       return new Response(JSON.stringify({ error: `All providers failed. Last: ${result.error}` }), { status: result.status || 502, headers });
     }
@@ -3742,7 +3740,7 @@ async function handleVisuals(body, env, headers) {
   }
 
   const result = await callOpenAI(VISUALS_SYSTEM_PROMPT, userMsg, env, {
-    model: "gpt-5.4",  // ★ 2026-05-11: visuals (#7) gpt-4.1 → gpt-5.4 (사용자 명시)
+    model: "gpt-4.1",
     temperature: 0.3,
     max_tokens: 8000,
   });
@@ -3825,7 +3823,7 @@ async function handleInsertCuts(body, env, headers) {
   }
 
   const result = await callOpenAI(INSERT_CUTS_SYSTEM_PROMPT, userMsg, env, {
-    model: "gpt-5.4",  // ★ 2026-05-11: insert-cuts (#8) gpt-4.1 → gpt-5.4 (사용자 명시)
+    model: "gpt-4.1",
     temperature: 0.3,
     max_tokens: 8000,
   });
@@ -3903,11 +3901,9 @@ async function handleHlRecommend(body, env, headers) {
       method: "POST",
       headers: { "Authorization": "Bearer " + env.OPENAI_API_KEY, "Content-Type": "application/json" },
       body: JSON.stringify({
-        // ★ 2026-05-11: hl-recommend (#9) gpt-4.1 → gpt-5.1 (사용자 명시)
-        // gpt-5.x 는 max_completion_tokens 필수
-        model: "gpt-5.1",
+        model: "gpt-4.1",
         messages: [{ role: "system", content: HL_RECOMMEND_PROMPT }, { role: "user", content: compressScriptForHl(body.script, 14000) }],
-        temperature: 0.5, max_completion_tokens: 2000,
+        temperature: 0.5, max_tokens: 2000,
       }),
     });
     const data = await res.json();
@@ -3968,10 +3964,9 @@ async function handleHlTimestamps(body, env, headers) {
       method: "POST",
       headers: { "Authorization": "Bearer " + env.OPENAI_API_KEY, "Content-Type": "application/json" },
       body: JSON.stringify({
-        // ★ 2026-05-11: hl-timestamps (#10) gpt-4.1 → gpt-5.1 (사용자 명시)
-        model: "gpt-5.1",
+        model: "gpt-4.1",
         messages: [{ role: "system", content: tsPrompt }, { role: "user", content: compressScriptForHl(body.script, 14000) }],
-        temperature: 0.4, max_completion_tokens: 2000,
+        temperature: 0.4, max_tokens: 2000,
       }),
     });
     const data = await res.json();
@@ -4091,21 +4086,11 @@ async function getNewsCount(keyword) {
   } catch (e) { return 0; }
 }
 
-async function callGPTForSetgen(system, user, apiKey, maxTokens, temp, model) {
-  // ★ 2026-05-11 사용자 명시 #11/#12: model 인자 추가, gpt-5.x 호환 위해 token 파라미터 분기
-  const useModel = model || "gpt-5.1";
-  const useCompletionTokens = /^(gpt-5|o[1-4])/.test(useModel);
-  const reqBody = {
-    model: useModel,
-    messages: [{ role: "system", content: system }, { role: "user", content: user }],
-    temperature: temp,
-  };
-  if (useCompletionTokens) reqBody.max_completion_tokens = maxTokens;
-  else reqBody.max_tokens = maxTokens;
+async function callGPTForSetgen(system, user, apiKey, maxTokens, temp) {
   var res = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: { "Authorization": "Bearer " + apiKey, "Content-Type": "application/json" },
-    body: JSON.stringify(reqBody),
+    body: JSON.stringify({ model: "gpt-4.1", messages: [{ role: "system", content: system }, { role: "user", content: user }], temperature: temp, max_tokens: maxTokens }),
   });
   var data = await res.json();
   if (data.error) throw new Error(data.error.message);
@@ -4122,8 +4107,8 @@ async function handleSetgen(body, env, headers) {
   if (!env.OPENAI_API_KEY) return new Response(JSON.stringify({ success: false, error: "OPENAI_API_KEY not configured" }), { status: 500, headers });
 
   try {
-    // Step 1: 키워드 + 인상적 발언 추출 — ★ 2026-05-11: gpt-4.1 → gpt-5.1 (사용자 명시 #11)
-    var kwResult = await callGPTForSetgen(SETGEN_KEYWORD_SYSTEM, compressScriptForHl(script, 10000), env.OPENAI_API_KEY, 800, 0.3, "gpt-5.1");
+    // Step 1: 키워드 + 인상적 발언 추출
+    var kwResult = await callGPTForSetgen(SETGEN_KEYWORD_SYSTEM, compressScriptForHl(script, 10000), env.OPENAI_API_KEY, 800, 0.3);
     var keywords = kwResult.keywords || [];
     var guestSummary = kwResult.guest_summary || "";
     var notableQuotes = kwResult.notable_quotes || [];
@@ -4182,11 +4167,10 @@ async function handleSetgen(body, env, headers) {
       thirdTemp = 0.7;
     }
 
-    // ★ 2026-05-11: 3 GPT 병렬 (Step 4) gpt-4.1 → gpt-5.4 (사용자 명시 #12)
     var setResults = await Promise.all([
-      callGPTForSetgen(makeSetgenPrompt("balanced"), userBase, env.OPENAI_API_KEY, 2000, 0.8, "gpt-5.4"),
-      callGPTForSetgen(makeSetgenPrompt("trend"), userBase, env.OPENAI_API_KEY, 2000, 0.85, "gpt-5.4"),
-      callGPTForSetgen(thirdPrompt, thirdUser, env.OPENAI_API_KEY, 2000, thirdTemp, "gpt-5.4"),
+      callGPTForSetgen(makeSetgenPrompt("balanced"), userBase, env.OPENAI_API_KEY, 2000, 0.8),
+      callGPTForSetgen(makeSetgenPrompt("trend"), userBase, env.OPENAI_API_KEY, 2000, 0.85),
+      callGPTForSetgen(thirdPrompt, thirdUser, env.OPENAI_API_KEY, 2000, thirdTemp),
     ]);
 
     // 결과 병합
