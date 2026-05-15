@@ -5,6 +5,36 @@ ttimes-editor 의 운영 변경 이력. 큐레이션된 형식 — 증상/원인
 
 ---
 
+## 2026-05-15 — 1차 교정 손실 + 0차 검토 탭 죽음 봉합 (★ 데이터 손실 결함)
+
+### 18. fix(data-loss): 1차 교정 diffs 손실 + 0차 검토 KV 박제 누락 (5 commit)
+
+- **증상 A**: 1차 교정 완료 후 다른 탭 갔다 오면 빨간 줄 사라짐 (diffs 영역 손실)
+- **증상 B**: 새 프로젝트 + docx 업로드 → 0차 검토 활성화 정상 → CMS 나갔다 들어오면 0차 검토 탭 죽음
+
+- **원인 A** (★ 본질) — worker `array_stable_id_union` 머지의 `_stableId` 박제 코드 부재:
+  - 주석엔 "AI 생성 항목은 이미 _stableId 박혀있다" 명시, 실제론 박제 코드 0건
+  - `/correct` 응답 chunk 구조에 fallback key 필드 (`blockIndex/posStart/posEnd/kind`) 없음
+  - → 모든 diffs가 fallback key `"||||"` 동일 → Map dedupe로 1개 압축 → log `diffs=29 → 1`
+- **원인 B** (★ 본질) — mount load 자동 0차 검토 생성 분기 (L766-797) 의 `setReviewData` 호출 시점이 `isInitialLoad.current = true` 영역 → useEffect L843 dirty skip → KV.review 영원히 빈 → 다음 mount stages filter 에서 review fetch 안 함 → 탭 비활성화 (닭-달걀)
+- **부수 원인** — L1493 `autoSaveToKV({ diffs: ad })` await 누락 (race 잠재)
+
+- **수정 5 commit**:
+  - `e459696` — L1493 await 추가
+  - `9e0b3b4` — `save PAYLOAD correction` sizeHint에 `diffs=N anal=Y/N` 추가 (진단)
+  - `e9d8332` — `ad.map((d,i) => ({ ...d, _stableId: ... }))` ★ 원인 A 봉합
+  - `1868317` — `onFileUpload` 영역 setReviewData 직후 await PUT
+  - `fd38643` — **mount load 자동 0차 검토 생성 영역** setReviewData 직후 await PUT ★ 원인 B 봉합
+
+- **검증** — log 박제:
+  - 1차 교정: `save PAYLOAD ... diffs=22 anal=Y` → `tabFresh loaded ... diffs=22 anal=Y` ✓
+  - 0차 검토: `save PAYLOAD review ...` → `load LOADED review ...` (다음 mount) ✓
+- **상세 사료**: [`ops/POSTMORTEM_DATA_LOSS_20260515.md`](./ops/POSTMORTEM_DATA_LOSS_20260515.md)
+- **잠재 영역** (미 fix, 사용자 명시 원칙 정합): L1714 하이라이트 / L1449 metadata / 다른 AI 생성 항목의 _stableId — 손실 보고 X
+- **prod editor repo cherry-pick 의무** — 본 5 commit 모두 prod 동일 결함 잠재 (사용자 명시 원칙 8: test → prod promote)
+
+---
+
 ## 2026-05-09 — lab 방향 전환 (코드 복사 → fresh v2 설계, 다 세션)
 
 ### 17. ops(lab): 방향 전환 — prod 코드 복사 → fresh v2 설계 (사료 전수 정독 기반)
