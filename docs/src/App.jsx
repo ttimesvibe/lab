@@ -401,10 +401,7 @@ function AuthenticatedApp({ authUser, onLogout, initialSessionId, onBackToDashbo
       const next = typeof val === "function" ? val(cur) : val;
       return { ...prev, [tabId]: { ...(prev[tabId] || {}), [fieldName]: next } };
     });
-    if (!isInitialLoad.current) {
-      console.log(`[r3-diag] dirty add: ${tabId} (setter ${fieldName})`);
-      dirtyTabs.current.add(tabId);
-    }
+    if (!isInitialLoad.current) dirtyTabs.current.add(tabId);
   };
   const setReviewData    = useCallback(_makeFieldSetter("review",     "reviewData",     null), []);
   const setBlocks        = useCallback(_makeFieldSetter("correction", "blocks",         []), []);
@@ -466,7 +463,6 @@ function AuthenticatedApp({ authUser, onLogout, initialSessionId, onBackToDashbo
 
     // dirty 마킹 — 약속 Y 메커니즘. markDirty=false 시 차단 (fetch / 초기 load).
     if (opts.markDirty !== false && !isInitialLoad.current) {
-      console.log(`[r3-diag] dirty add: ${tabId} (patchTab keys=[${Object.keys(partial).join(",")}])`);
       dirtyTabs.current.add(tabId);
     }
   }, []);
@@ -507,9 +503,7 @@ function AuthenticatedApp({ authUser, onLogout, initialSessionId, onBackToDashbo
         patchTab(tabId, pickFields(tabId, data), { markDirty: false });
         if (data.savedAt) lastLoadedAt.current[tabId] = data.savedAt;
         if (data.version !== undefined) lastLoadedVersion.current[tabId] = data.version;
-        const sz = tabId === "correction" ? `blocks=${data?.blocks?.length} diffs=${data?.diffs?.length} anal=${data?.anal ? "Y" : "N"}` :
-                   tabId === "guide" ? `hl=${data?.hl?.length}` : "";
-        console.log(`[r3-diag] tabFresh loaded: ${tabId} keys=[${Object.keys(data).join(",")}] ${sz}`);
+        console.log(`[r3-diag] tabFresh loaded: ${tabId} keys=[${Object.keys(data).join(",")}]`);
       }
     }).catch(e => {
       console.warn(`[r3-diag] tabFresh failed: ${tabId} — ${e?.message || e}`);
@@ -728,7 +722,7 @@ function AuthenticatedApp({ authUser, onLogout, initialSessionId, onBackToDashbo
                 const keys = v ? Object.keys(v).join(",") : "null";
                 const sz = tabs[i] === "modify" ? `cards=${v?.cards?.length}` :
                            tabs[i] === "guide" ? `hl=${v?.hl?.length}` :
-                           tabs[i] === "correction" ? `blocks=${v?.blocks?.length} diffs=${v?.diffs?.length} anal=${v?.anal ? "Y" : "N"}` :
+                           tabs[i] === "correction" ? `blocks=${v?.blocks?.length}` :
                            tabs[i] === "highlight" ? `clips=${v?.clips?.length}` :
                            tabs[i] === "visual" ? `guides=${v?.visualGuides?.length}` : "";
                 console.log(`[r3-diag] load LOADED ${tabs[i]}: keys=[${keys}] ${sz}`);
@@ -843,23 +837,18 @@ function AuthenticatedApp({ authUser, onLogout, initialSessionId, onBackToDashbo
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── dirty 탭 추적: 데이터 변경 시 해당 탭을 dirty로 마킹 ──
-  // R3.d-diag2 (2026-05-15) — 5개 exportCache.* useEffect 와 대칭 log 정합.
-  //   fresh load 직후 dirty add 가 fire 되는지 timeline 추적용 (옵션 가" 진단 강화).
   useEffect(() => {
     if (isInitialLoad.current) return;
-    console.log("[r3-diag] dirty add: correction (useEffect)");
     dirtyTabs.current.add("correction");
   }, [blocks, anal, diffs, scriptEdits, blockDeletions]);
 
   useEffect(() => {
     if (isInitialLoad.current) return;
-    console.log("[r3-diag] dirty add: guide (useEffect)");
     dirtyTabs.current.add("guide");
   }, [hl, hlStats, hlVerdicts, hlEdits, hlMarkers]);
 
   useEffect(() => {
     if (isInitialLoad.current) return;
-    console.log("[r3-diag] dirty add: review (useEffect)");
     dirtyTabs.current.add("review");
   }, [reviewData]);
 
@@ -1011,7 +1000,7 @@ function AuthenticatedApp({ authUser, onLogout, initialSessionId, onBackToDashbo
       const keys = d ? Object.keys(d).join(",") : "null";
       const sizeHint = t === "modify" ? `cards=${d?.cards?.length}` :
                        t === "guide" ? `hl=${d?.hl?.length}` :
-                       t === "correction" ? `blocks=${d?.blocks?.length} diffs=${d?.diffs?.length} anal=${d?.anal ? "Y" : "N"}` :
+                       t === "correction" ? `blocks=${d?.blocks?.length}` :
                        t === "highlight" ? `clips=${d?.clips?.length}` :
                        t === "visual" ? `guides=${d?.visualGuides?.length}` : "";
       console.log(`[r3-diag] save PAYLOAD ${t}: keys=[${keys}] ${sizeHint}`);
