@@ -772,12 +772,18 @@ function AuthenticatedApp({ authUser, onLogout, initialSessionId, onBackToDashbo
               const savedFullText = td.manuscript.fullText || msText;
               setFn(msName);
 
+              // ★ 0차 검토 KV 박제 fix (2026-05-15) — mount load 영역의 자동 생성 분기
+              //    이전 영역: setReviewData 호출 시점 = isInitialLoad.current=true → useEffect L843 skip
+              //    → dirty 마킹 X → 30s 자동저장 fire X → KV.review 영원히 빈 영역
+              //    → 다음 mount 영역의 stages filter (L716-718) 에서 review load X → 탭 비활성화 (닭-달걀)
+              //    fix: setReviewData 직후 명시 await PUT 박제 → worker meta.stages.review 자동 박제 → 다음 mount 영역 정상.
+              let newReviewData;
               if (savedParagraphs && savedHasTrackChanges) {
                 // ── 변경 추적 데이터로 0차 검토 정상 구성 ──
                 const reviewBlocks = parseBlocks(savedFullText);
                 const { blockStrikeRanges, deletedBlockIndices } = computeBlockStrikes(savedParagraphs, reviewBlocks, savedFullText);
                 const duration = calcDuration(reviewBlocks, new Set(deletedBlockIndices));
-                setReviewData({
+                newReviewData = {
                   hasTrackChanges: true,
                   deletedBlockIndices,
                   blockStrikeRanges,
@@ -786,7 +792,8 @@ function AuthenticatedApp({ authUser, onLogout, initialSessionId, onBackToDashbo
                   cleanTextChars: msText.length,
                   paragraphs: savedParagraphs,
                   cleanText: msText,
-                });
+                };
+                setReviewData(newReviewData);
                 // blocks는 cleanText 기준 — 1차 교정 이후 단계가 삭제 반영된 본문 사용
                 setBlocks(parseBlocks(msText));
               } else {
@@ -794,10 +801,13 @@ function AuthenticatedApp({ authUser, onLogout, initialSessionId, onBackToDashbo
                 const reviewBlocks = parseBlocks(msText);
                 const duration = calcDuration(reviewBlocks);
                 const paragraphs = savedParagraphs || msText.split('\n').map(line => [{ text: line, deleted: false }]);
-                setReviewData({ hasTrackChanges: false, deletedBlockIndices: [], blockStrikeRanges: {}, duration, reviewBlocks, cleanTextChars: msText.length, paragraphs, cleanText: msText });
+                newReviewData = { hasTrackChanges: false, deletedBlockIndices: [], blockStrikeRanges: {}, duration, reviewBlocks, cleanTextChars: msText.length, paragraphs, cleanText: msText };
+                setReviewData(newReviewData);
                 setBlocks(reviewBlocks);
               }
               setTabWithFreshness("review");
+              // ★ 즉시 KV PUT — isInitialLoad 영역의 useEffect dirty skip 우회
+              try { await autoSaveToKV({ reviewData: newReviewData }); } catch (e) { console.warn("[review] auto PUT 실패:", e?.message); }
             } else {
               setTabWithFreshness(hasHl ? "guide" : c.blocks?.length > 0 ? "correction" : "correction");
             }
