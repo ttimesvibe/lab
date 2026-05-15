@@ -1868,11 +1868,16 @@ function AuthenticatedApp({ authUser, onLogout, initialSessionId, onBackToDashbo
 
           const duration = calcDuration(reviewBlocks, deletedBlockIndices);
           const cleanTextChars = cleanText.length;
-          setReviewData({ hasTrackChanges: true, deletedBlockIndices: [...deletedBlockIndices], blockStrikeRanges, duration, reviewBlocks, cleanTextChars, paragraphs: tcResult.paragraphs, cleanText });
+          // ★ 0차 검토 fix (2026-05-15) — setReviewData 호출 직후 await PUT 박제
+          //    누락 시 30s timer 영역 fire 안 되면 stages.review = false 유지 →
+          //    다음 mount 영역에서 review 탭 load X → 탭 비활성화 (닭-달걀 영역)
+          const newReviewData = { hasTrackChanges: true, deletedBlockIndices: [...deletedBlockIndices], blockStrikeRanges, duration, reviewBlocks, cleanTextChars, paragraphs: tcResult.paragraphs, cleanText };
+          setReviewData(newReviewData);
           // blocks는 cleanText 기준 — 0차 review는 reviewData.paragraphs로 독립 렌더
           setBlocks(parseBlocks(cleanText));
           setTabWithFreshness("review");
           setDiffs([]); setHl([]); setHlStats(null); setGReady(false); setTermReview(false);
+          await autoSaveToKV({ reviewData: newReviewData });
           return;
         }
       } catch (e) {
@@ -1885,22 +1890,28 @@ function AuthenticatedApp({ authUser, onLogout, initialSessionId, onBackToDashbo
       const duration = calcDuration(reviewBlocks);
       const paragraphs = plainText.split('\n').map(line => [{ text: line, deleted: false }]);
       setFn(file.name);
-      setReviewData({ hasTrackChanges: false, deletedBlockIndices: [], blockStrikeRanges: {}, duration, reviewBlocks, cleanTextChars: plainText.length, paragraphs, cleanText: plainText });
+      // ★ 0차 검토 fix — await PUT 박제 (L1871 영역과 동일)
+      const newReviewData = { hasTrackChanges: false, deletedBlockIndices: [], blockStrikeRanges: {}, duration, reviewBlocks, cleanTextChars: plainText.length, paragraphs, cleanText: plainText };
+      setReviewData(newReviewData);
       setBlocks(reviewBlocks);
       setTabWithFreshness("review");
       setDiffs([]); setHl([]); setHlStats(null); setGReady(false); setTermReview(false);
+      await autoSaveToKV({ reviewData: newReviewData });
     } else {
       const text = await file.text();
       const reviewBlocks = parseBlocks(text);
       const duration = calcDuration(reviewBlocks);
       const paragraphs = text.split('\n').map(line => [{ text: line, deleted: false }]);
       setFn(file.name);
-      setReviewData({ hasTrackChanges: false, deletedBlockIndices: [], blockStrikeRanges: {}, duration, reviewBlocks, cleanTextChars: text.length, paragraphs, cleanText: text });
+      // ★ 0차 검토 fix — await PUT 박제 (L1871 영역과 동일)
+      const newReviewData = { hasTrackChanges: false, deletedBlockIndices: [], blockStrikeRanges: {}, duration, reviewBlocks, cleanTextChars: text.length, paragraphs, cleanText: text };
+      setReviewData(newReviewData);
       setBlocks(reviewBlocks);
       setTabWithFreshness("review");
       setDiffs([]); setHl([]); setHlStats(null); setGReady(false); setTermReview(false);
+      await autoSaveToKV({ reviewData: newReviewData });
     }
-  },[handleFile]);
+  },[handleFile, autoSaveToKV]);
 
   const fileRef = useRef(null);
   const [drag,setDrag] = useState(false);
