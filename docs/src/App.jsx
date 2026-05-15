@@ -1543,11 +1543,20 @@ function AuthenticatedApp({ authUser, onLogout, initialSessionId, onBackToDashbo
       source_text: "",
       subtitle: addForm.subtitle.trim(),
       type: addForm.type,
-      type_name: addForm.type === "B2" ? "용어 설명형" : addForm.type === "C1" ? "추가 삭제" : "수동 추가",
+      // ★ type_name (2026-05-16):
+      //   B2 = AI 용어 설명형 / C_user = 사용자 수동 자료 (★ 자료 탭 재도입)
+      //   C1 분기는 옛 KV 데이터 (4/7~4/14 박제) 정합 보존용 유지 — 새 사용자 영역 X
+      type_name: addForm.type === "B2" ? "용어 설명형"
+               : addForm.type === "C_user" ? "자료"
+               : addForm.type === "C1" ? "추가 삭제"
+               : "수동 추가",
       reason: "편집자 수동 추가",
       placement_hint: null,
       sequence_id: null,
       _manual: true, // 수동 추가 표시
+      // ★ _stableId 박제 (2026-05-16) — worker array_stable_id_union 머지의 dedupe 정합 의무
+      //   누락 시 fallbackKey (subtitle|speaker|startMs) 충돌 시 1개 압축 위험
+      _stableId: `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
     };
     setHl(prev => [...prev, newItem]);
     // 자동으로 '사용' 판정

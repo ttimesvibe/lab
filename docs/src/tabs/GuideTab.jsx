@@ -326,7 +326,7 @@ export default function GuideTab({
             <div onClick={e=>e.stopPropagation()} style={{margin:"0 16px 10px",padding:12,borderRadius:10,
               border:`1px solid ${C.hBd}`,background:"rgba(168,85,247,0.06)"}}>
               <div style={{display:"flex",gap:6,marginBottom:8}}>
-                {[["A1","강조자막"],["B2","용어 설명"]].map(([t,l])=>
+                {[["A1","강조자막"],["B2","용어 설명"],["C_user","자료"]].map(([t,l])=>
                   <button key={t} onClick={()=>setAddForm(f=>({...f,type:t}))}
                     style={{fontSize:11,fontWeight:600,padding:"3px 10px",borderRadius:5,cursor:"pointer",
                       border:`1px solid ${addForm.type===t?C.hBd:"transparent"}`,
@@ -349,7 +349,7 @@ export default function GuideTab({
                 </div>
               )}
               <textarea value={addForm.subtitle} onChange={e=>setAddForm(f=>({...f,subtitle:e.target.value}))}
-                placeholder={addForm.type==="B2"?"용어(English) : 설명":addForm.type==="C1"?"추가 삭제 내용":"강조자막 내용"}
+                placeholder={addForm.type==="B2"?"용어(English) : 설명":addForm.type==="C_user"?"자료 내용 (예: 관련 기사 캡쳐 이미지)":addForm.type==="C1"?"추가 삭제 내용":"강조자막 내용"}
                 rows={2} autoFocus={addForm.type!=="B2"}
                 style={{width:"100%",padding:"6px 8px",borderRadius:6,border:`1px solid ${C.bd}`,
                   background:"rgba(0,0,0,0.3)",color:C.tx,fontSize:13,fontFamily:"'Pretendard',sans-serif",
