@@ -59,7 +59,8 @@ export const MERGE_STRATEGIES = {
     verdicts: { kind: "object_merge_recursive" },
     visualMarkers: { kind: "object_merge_recursive" },
   },
-  highlight: { clips: { kind: "array_stable_id_union", entityType: "hl" }, recs: { kind: "last_write_wins" } },
+  // ★ highlight.clips (2026-05-15) — worker/merge.js 와 정합. 클라/worker 영역 의미론 일치 의무.
+  highlight: { clips: { kind: "last_write_wins" }, recs: { kind: "last_write_wins" } },
   setgen: { result: { kind: "object_merge_recursive" }, sel: { kind: "object_merge_recursive" }, edits: { kind: "object_merge_recursive" } },
   review: { __recursive: true },  // 단순 객체 — 통째 재귀 deep merge
   metadata: { __recursive: true },

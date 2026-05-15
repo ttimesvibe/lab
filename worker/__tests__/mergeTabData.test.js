@@ -234,6 +234,53 @@ describe("mergeTabData — id-fallback dedupe (data loss regression)", () => {
   });
 });
 
+// ───────────────────────────────────────────────────────────────────────────
+// highlight.clips — last_write_wins 회귀 (2026-05-15)
+// ───────────────────────────────────────────────────────────────────────────
+// 배경: 옛 array_stable_id_union 영역의 union 의미론 = 사용자 삭제 인식 X →
+//       PUT에서 빠진 항목이 KV에 보존되어 fresh load 시 부활.
+//       last_write_wins 변경 후 PUT body 그대로 KV 박제 → 사용자 삭제 정합.
+// 멀티유저 시나리오는 version + 409 + ConflictModal 영역으로 봉합.
+// 상세: ops/POSTMORTEM_DATA_LOSS_20260515.md §10
+describe("mergeTabData — highlight.clips last_write_wins (deletion regression)", () => {
+  test("highlight.clips: 사용자 삭제 시 KV 정합 (PUT 그대로 박제)", () => {
+    const ex = { clips: [{ id: "a" }, { id: "b" }, { id: "c" }] };
+    const inc = { clips: [{ id: "a" }, { id: "b" }] };   // c 삭제
+    const m = mergeTabData(ex, inc, "highlight");
+    assert.equal(m.clips.length, 2);                       // ★ 옛 union 이면 3개로 부활
+    assert.deepEqual(m.clips.map(c => c.id).sort(), ["a", "b"]);
+  });
+
+  test("highlight.clips: 빈 배열 PUT — 모두 삭제 정합", () => {
+    const ex = { clips: [{ id: "a" }, { id: "b" }] };
+    const inc = { clips: [] };
+    const m = mergeTabData(ex, inc, "highlight");
+    assert.equal(m.clips.length, 0);                       // ★ 옛 union 이면 2개 그대로
+  });
+
+  test("highlight.clips: 새 항목 추가 정합", () => {
+    const ex = { clips: [{ id: "a" }] };
+    const inc = { clips: [{ id: "a" }, { id: "b" }] };
+    const m = mergeTabData(ex, inc, "highlight");
+    assert.equal(m.clips.length, 2);
+  });
+
+  test("highlight.clips: 수정 (같은 id, 다른 text) — incoming 박제", () => {
+    const ex = { clips: [{ id: "a", text: "old" }] };
+    const inc = { clips: [{ id: "a", text: "new" }] };
+    const m = mergeTabData(ex, inc, "highlight");
+    assert.equal(m.clips.length, 1);
+    assert.equal(m.clips[0].text, "new");
+  });
+
+  test("highlight.recs: last_write_wins 영역 (이미 적용된 영역, 회귀)", () => {
+    const ex = { recs: { keyword: "old" } };
+    const inc = { recs: { keyword: "new" } };
+    const m = mergeTabData(ex, inc, "highlight");
+    assert.deepEqual(m.recs, { keyword: "new" });
+  });
+});
+
 describe("mergeTabData — manuscript (__replace)", () => {
   test("manuscript: 통째 교체 (재업로드 시)", () => {
     const ex = { paragraphs: ["old1", "old2"] };

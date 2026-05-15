@@ -133,3 +133,117 @@ lab = prod editor clone 영역. 본 5 commit 모두 prod에 같은 결함 잠재
 - **`_stableId` 박제 위치 박제** — AI 생성 항목 응답 시점 / 클라 setter 직전 중 단일 위치 결정. 본 fix는 클라 setter 직전. worker `/correct` 응답에서 박제하는 영역으로 옮기면 일관성 강화 가능 (추후 검토)
 - **mount load 자동 생성 분기 영역 일반화** — 0차 검토 외 다른 자동 생성 분기 있는지 검토 (현재 review만 발견)
 - **isInitialLoad 영역의 dirty skip 정합 영역 재검토** — 약속 Y 의미론과 충돌. 본 fix는 명시 await PUT으로 우회. 의미론 정리 의무
+
+---
+
+## 10. 추가 발견 — highlight.clips 삭제 박스 부활 결함 (2026-05-15 영역 2)
+
+### 증상
+사용자 보고 — highlight 탭에서 박스 생성 → X 클릭 삭제 → 새 박스 추가 시 삭제된 박스와 새 박스가 동시 표시. fresh load 후 삭제 박스 부활.
+
+log 박제 (prod build `BJVOmFuU`):
+```
+clips=13 → 8 → 7 → 6 (사용자 삭제 진행)
+fresh load → clips=13 (부활)
+```
+
+### 원인 — worker `array_stable_id_union` 의 union 의미론
+
+```js
+// worker/merge.js
+highlight: { clips: { kind: "array_stable_id_union", entityType: "hl" } }
+```
+
+`arrayIdUnion(existingArr, incomingArr, idFn)` = **합집합**. PUT body에 없는 항목도 KV에 있으면 보존.
+
+시나리오 정합:
+1. state.clips = [A, B, C, D] → PUT [A,B,C,D] → KV [A,B,C,D]
+2. 사용자 C 삭제 → state.clips = [A, B, D] → PUT [A,B,D]
+3. worker union: KV[A,B,C,D] ∪ PUT[A,B,D] = ★ [A,B,C,D] (C 부활)
+4. fresh load → state [A,B,C,D] → 화면 4개 (삭제 박스 부활)
+
+### 옛 앱과의 비교
+
+`ttimes-hilight/worker/index.js` L135:
+```js
+await env.SESSIONS.put("save_" + id, JSON.stringify(body.session));
+```
+
+= 통째 덮어쓰기 (last_write_wins). 단일 사용자 정상 동작. **본 결함 없음**.
+
+### 정밀 분석 — R3 / 자식 추출 / 스파게티 정리 영역에서 왜 못 봤나
+
+#### 영역 1 — 같은 머지 함수의 결함이 이미 한 번 봉합됨 (commit `9a6cef0`, 2026-05-09)
+- 이전 사용자 보고: "저장 → 나갔다 들어오면 마지막 1개만 남음"
+- 원인: fallbackKeySync 키 mismatch → 모든 항목 `"|||"` 충돌 → Map.set 마지막 덮어쓰기
+- fix: `id` universal 분기 추가 (`fallbackKeySync` 첫 줄)
+- ★ **단 union 의미론 자체는 그대로** — "추가 손실" 봉합에만 집중, "삭제 손실" 영역 미검증
+
+#### 영역 2 — 같은 결함 3회 발견, 의미론 전체 재검토 영역 X
+
+| 시점 | 표면 결함 | fix | 머지 의미론 |
+|---|---|---|---|
+| `9a6cef0` (2026-05-09) | 추가 1개로 압축 | id 분기 | 그대로 |
+| 본 세션 #1 (2026-05-15) | diffs 1개로 압축 | `_stableId` 박제 | 그대로 |
+| 본 보고 #2 (2026-05-15) | 삭제 박스 부활 | 미 fix | 그대로 ★ |
+
+★ 매번 별 표면 결함으로 진단 + 봉합. 머지 함수 전체 재검토 영역 의무 박제 X.
+
+#### 영역 3 — 옛 앱과의 의미론 비교 부재
+- 옛 앱 (ttimes-hilight) = `last_write_wins` (통째 PUT) — 단일 사용자 정상
+- 통합 CMS = `array_stable_id_union` — 멀티유저 union 도입
+- R3 / 통합 시점에 머지 의미론을 **의도적으로 변경** — 단 trade-off 박제 X:
+  - 얻은 영역 (멀티유저 동시 추가 보존) 명시
+  - **잃은 영역 (단일 사용자 삭제 의미론) 박제 X**
+
+#### 영역 4 — 테스트 시나리오 영역 부족
+worker `__tests__/mergeTabData.test.js` 47 PASS:
+- ✓ 두 클라가 추가 → 합집합
+- ✓ 한 클라 추가, 다른 클라 수정 → 머지
+- ✓ id-fallback 회귀 (1개로 압축 회피)
+- ★ **한 클라가 삭제 시나리오 — 박제 0**
+
+= 테스트가 union의 "추가만" 의미론 전제. "삭제" 시나리오 박제 의무 X.
+
+#### 영역 5 — R3 검증 영역의 범위
+R3.b-diag / R3.c-prep / R3.d.2.* 모두 **클라이언트 영역** 사고 (무한 루프 / closure stale / useState 통합 / dirty 마킹). worker `merge.js` 영역의 검증 = R3 범위 밖. 헌장 §5/§6 "11 탭 동등"도 클라 영역만 박제.
+
+#### 영역 6 — 헌장의 의미론 명시 부재
+- §1 30s cascading throttle
+- §2 약속 X (fresh fetch)
+- §5/§6 11 탭 동등 dispatch
+- ★ **"삭제 시 KV 정합" 영역 박제 0**
+
+사용자 의도 영역 (삭제 동작) 명시 X → 머지 의미론 검증 의무 박제 X.
+
+### 영향 잠재 영역
+
+같은 union 머지 영역의 모든 항목 = 같은 결함 잠재:
+
+| 탭.필드 | 결함 발현 |
+|---|---|
+| **highlight.clips** | ★ 사용자 보고 발현 |
+| guide.hl | (AI 생성, 사용자 삭제 영역 사용 X) — 잠재 |
+| visual.visualGuides / insertCuts / manualResources | 사용자 삭제 영역 사용 시 발현 |
+| modify.cards | 사용자 삭제 영역 사용 시 발현 |
+| correction.diffs | (AI 생성, 사용자 삭제 영역 X) — 잠재 |
+
+### 해결 옵션
+
+**옵션 A** — `highlight.clips: { kind: "last_write_wins" }` (옛 앱 정합)
+- 장점: 단일 사용자 정상, 단순, 위험 0
+- 단점: 멀티유저 동시 추가 영역 손실 (실제 사용 빈도 거의 0)
+
+**옵션 B** — Tombstone 메커니즘 (CRDT)
+- 장점: 멀티유저 + 삭제 둘 다 정합
+- 단점: 클라/worker 양쪽 영역 변경 큼
+
+**옵션 C** — Hybrid (PUT body `_replace` flag)
+- 장점: 멀티유저 보존 + 사용자 명시 영역 정합
+- 단점: 클라 영역 영역 영역 변경 의무
+
+### 사후 의무 (본 영역)
+- 머지 의미론 trade-off 박제 (사용자 결정 박제)
+- 헌장 영역에 "삭제 시 KV 정합" 영역 추가 박제
+- 테스트 영역에 삭제 시나리오 박제 의무
+- 옛 앱과 통합 CMS 의미론 비교 사료 박제
