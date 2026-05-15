@@ -2529,7 +2529,8 @@ async function handleCorrect(body, env, headers) {
   userMsg += `[Correction target — chunk ${(chunk_index||0)+1}/${total_chunks||1}]\n${chunk_text}`;
 
   for (let attempt = 0; attempt < 3; attempt++) {
-    const result = await callOpenAI(systemPrompt, userMsg, env, { max_tokens: 32000 });
+    // ★ 2026-05-16 사용자 명시: lab(test) /correct 만 gpt-5.4 (default gpt-5.1 유지, 다른 endpoint 영향 X)
+    const result = await callOpenAI(systemPrompt, userMsg, env, { model: "gpt-5.4", max_tokens: 32000 });
     if (result.error && result.status === 429) { await new Promise(r => setTimeout(r, (attempt+1)*3000)); continue; }
     if (result.error) return new Response(JSON.stringify({ error: result.error }), { status: result.status||500, headers });
     // v4: 코드 검증 적용 (analysis.term_corrections 를 guardrail에 전달)
