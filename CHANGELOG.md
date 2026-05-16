@@ -5,6 +5,55 @@ ttimes-editor 의 운영 변경 이력. 큐레이션된 형식 — 증상/원인
 
 ---
 
+## 2026-05-16 — 자료 탭 재도입 + 라벨 정합 + 모델 매트릭스 조정
+
+### 22. feat(ai): lab /correct 만 gpt-5.4 박제 (commit `a45d00c`)
+
+- **사용자 명시**: lab 1차 교정 청크별 교정 (/correct) 만 gpt-5.4
+- **변경 영역**: `worker/index.js` L2531 1 줄 — `callOpenAI` 호출에 `model: "gpt-5.4"` 명시
+- **다른 endpoint**: default (gpt-5.1) 유지 → 영향 0
+- **검증**: worker 테스트 99/99 PASS, Worker Version `7476ccf7`
+
+### 21. revert(ai): lab 모델 매트릭스 prod 정합 영역으로 롤백 (commit `e841be4`, ★ b369ccb 폐기)
+
+- **사용자 명시**: lab(test) 모델을 prod 와 정합 영역으로 맞춤
+- **방법**: prod `worker/index.js` 그대로 복사 + auth URL (lab-auth.ttimes.workers.dev) 만 lab 전용 복원
+- **폐기된 매트릭스 (b369ccb 2026-05-11)**:
+  - #1 /analyze gpt-5.4 → gpt-5.1
+  - #2 /correct gpt-5.4 → gpt-5.1 (그 후 #22 에서 다시 gpt-5.4)
+  - #3 /highlights Draft gpt-5.4 → gpt-5.1
+  - #4 /highlights Editor gpt-5.4 → gpt-5.1
+  - #5 /subtitle-format × 6 gpt-5.4 → gpt-5.4-mini
+  - #6 /term-explain 폴백 gpt-5.1 → gpt-4.1-mini
+  - #7 visuals gpt-5.4 → gpt-4.1
+  - #8 insert-cuts gpt-5.4 → gpt-4.1
+  - #9 hl-recommend gpt-5.1 → gpt-4.1 (token 파라미터도 max_tokens 복원)
+  - #10 hl-timestamps gpt-5.1 → gpt-4.1 (token 파라미터도 max_tokens 복원)
+  - #11/#12 setgen callGPTForSetgen model 인자 제거
+- **보존**: lab 전용 auth URL + 본 세션 다른 fix 영역 모두 무영향
+- **검증**: worker 테스트 99/99 PASS, Worker Version `058ed15e`
+
+### 20. feat(guide): 자료 탭 재도입 + 드롭다운 라벨 정합 (commit `85c4e4d` + `9bde89f`)
+
+- **변경 1 — 드롭다운 라벨**: `BlockComponents.jsx` L162 "추가 삭제" → "자료" (다른 위치는 이미 "자료" 박제, 드롭다운만 잔존하던 비대칭 봉합)
+- **변경 2 — 자료 탭 재도입**: `GuideTab.jsx` 자막 추가 폼에 `["C_user","자료"]` 탭 추가
+- **옛 자료 탭의 진짜 버그**: displayCat 의미론 충돌
+  - `BlockComponents.jsx` L149: `type="C1" → effectiveCat="A" → "자막"` 강제 표시
+  - 옛 자막 추가 폼에서 사용자 자료에 type="C1" 박제 → 의도(자료)와 화면(자막) 불일치
+  - 본 fix = `C_user` 키 사용 → `effectiveCat="C" → "자료"` 정합
+- **dead 분기 발견**: C1 탭 UI 는 제거됐지만 처리 분기 2 곳 잔존 (App.jsx L1546, GuideTab.jsx L352). 본 fix 는 분기 유지 (옛 KV 데이터 정합 보존)
+- **변경 영역 (3 파일, 5 줄)**:
+  - `BlockComponents.jsx` L162: 드롭다운 라벨
+  - `GuideTab.jsx` L329: 탭 [A1, B2, C_user]
+  - `GuideTab.jsx` L352: placeholder C_user 분기
+  - `App.jsx` L1546: type_name C_user → "자료"
+  - `App.jsx` L1540: `_stableId` 박제 (본 세션 #1 dedupe 봉합 패턴)
+- **검증**: lab 영역에서 hl=2 → 4 → 5 → 6 정상 증가, 머지 충돌 0, TypeBadge 3 영역 매칭 ✓
+- **KV 영향**: 옛 type="C1" 항목 = "자막" 표시 (옛 의미론 보존), 새 항목 (C_user) = _stableId 박제로 dedupe 충돌 0
+- **상세 사후 박제**: `ops/POSTMORTEM_DATA_LOSS_20260515.md` §11 (dead 분기 audit)
+
+---
+
 ## 2026-05-15 — highlight.clips 삭제 부활 결함 봉합 (옵션 A: last_write_wins)
 
 ### 19. fix(merge): highlight.clips union → last_write_wins (★ 사용자 삭제 정합)

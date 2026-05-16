@@ -247,3 +247,105 @@ R3.b-diag / R3.c-prep / R3.d.2.* 모두 **클라이언트 영역** 사고 (무�
 - 헌장 영역에 "삭제 시 KV 정합" 영역 추가 박제
 - 테스트 영역에 삭제 시나리오 박제 의무
 - 옛 앱과 통합 CMS 의미론 비교 사료 박제
+
+---
+
+## §11. 추가 발견 — dead 분기 audit (2026-05-16 영역 3)
+
+### 증상
+사용자 명시 — "자료 탭이 옛 영역에 박제됐다가 중간에 없앴음". 단 자료 탭 재도입 의무 영역에서 코드 영역 박제:
+
+| 위치 | 상태 |
+|---|---|
+| `BlockComponents.jsx` L162 드롭다운 | 제거됨 (현재 [A,B,C_user] 박제) |
+| `App.jsx` L1546 `type === "C1"` 분기 | ★ **코드에 남아있음 (dead)** |
+| `GuideTab.jsx` L352 `type==="C1"` placeholder 분기 | ★ **코드에 남아있음 (dead)** |
+| `GuideTab.jsx` L329 자막 추가 폼 탭 `["C1","자료"]` | 제거됨 |
+
+= UI 입구만 막고 처리 로직은 안 지운 절반 청소. 사용자 눈에 안 보이지만 코드에는 잔존.
+
+### git log 추적
+- `dab4ec6` (2026-04-07): 자료 탭 추가 (type="C1")
+- `5e91d7c` (2026-04-14): 라벨 "자료" → "추가 삭제" 변경
+- (그 후): C1 탭 자체 제거 — commit 박제 못 찾음 (사료 영역 부재)
+
+### R3 / 스파게티 정리에서 못 본 이유 (4 영역)
+
+1. **정리 작업의 정의가 좁았음** — R3 / 스파게티 정리는 dirty 마킹 / closure stale / useState 통합 / 11 탭 동등 dispatch 영역에 초점. 단순 UI 라벨 / addForm 분기 / dead code 청소 영역 미포함
+2. **자동 검출 불가** — `addForm.type === "C1"` 분기는 문법상 실행 가능 (외부 데이터로 type="C1" 들어올 수 있음) → ESLint dead code 검출 영역 X. 수동 audit 의무 영역
+3. **C1 탭 제거 commit의 사료 부재** — 추가/라벨변경 commit은 박제됐는데 탭 자체 제거 commit 박제 영역 부재
+4. **사용자 명시 원칙의 부작용** — "사용자 보고한 영역만 fix" 원칙 정합. 단 ★ 사용자에게 보이지 않는 결함은 검증 의무에서도 빠짐
+
+### 본 fix 영역의 처리
+C_user 신설 + C1 분기 유지 (옛 KV 데이터 정합 보존):
+- 새 자료 항목 = type="C_user" 박제 → "자료" 표시
+- 옛 KV의 type="C1" 항목 = "자막" 표시 (옛 displayCat 의미론 보존)
+
+### 사후 의무
+- **dead code audit** — 본 세션처럼 표면적 UI 제거 후 처리 분기 잔존 영역 발견 의무. 전체 코드베이스 grep 영역 의무
+- **머지 의미론 audit** — array_stable_id_union 사용하는 다른 항목 (modify.cards / visualGuides / insertCuts / manualResources / guide.hl) 영역의 삭제 시나리오 박제 의무
+- **헌장 영역 확장** — "삭제 시 KV 정합" / "dead code 금지" / "UI 제거 시 처리 분기도 같이 제거" 영역 박제
+
+---
+
+## §12. 운영 영역 박제 — KV PUT 한도 + 단어장 누적 (2026-05-16 영역)
+
+### KV PUT 한도 초과 (운영 사료)
+
+**증상**: lab worker 모든 endpoint 500 — `{"error":"KV put() limit exceeded for the day."}`
+
+**원인**: Cloudflare Workers 무료 플랜 KV 한도:
+- PUT (쓰기): 1,000/일
+- READ: 100,000/일
+
+본 세션 동안 lab 영역 PUT 누적:
+- 1차 교정 / 0차 검토 재현 테스트 (여러 세션)
+- highlight.clips 삭제/추가 재현 (매 박제마다 PUT)
+- 자료 탭 재도입 재현 (hl=2→4→5→6, 매번 PUT)
+- 30s cascading throttle 영역의 PUT 빈도
+
+**본 세션 fix와 100% 무관** — 단순 운영 한도 초과.
+
+**해결**: UTC 00:00 (한국 09:00) 카운터 리셋 대기 (사용자 명시 옵션 1).
+
+**prod 영향 0**: prod (ttimes6000 계정) ≠ lab (ttimesvibe 계정) → 한도 별. lab 한도 초과 시 prod 정상 동작.
+
+**잠재 개선 영역** (선택, 사용자 명시 X):
+- 30s timer → 60s/120s 영역 영역
+- 동일 데이터 PUT skip 영역 강화 (snapshot 비교 박제됨, 추가 강화 가능)
+- 자동저장 dedupe 강화
+
+### 단어장 누적의 정상 부수 효과
+
+**증상**: Step 0 (사전 분석) 후 "AI 발견 오인식 후보 0건" 박제.
+
+**원인**: handleAnalyze 영역 (L2057-2067):
+```js
+if (dictionary_words?.length > 0) {
+  systemPrompt += "Team Dictionary (...) MUST EXCLUDE from term_corrections";
+  for (const word of dictionary_words) {
+    systemPrompt += `- "${word}"\n`;
+  }
+}
+```
+
+= AI에게 단어장 단어를 term_corrections에 포함하지 말 것 명시.
+
+본 세션 동안 단어장 누적 박제 (log 영역):
+```
+📚 단어장에 5건 추가됨 (총 279건)
+📚 단어장에 4건 추가됨 (총 288건)
+📚 단어장에 1건 추가됨 (총 289건)
+📚 단어장에 2건 추가됨 (총 291건)
+```
+
+같은 docx (박종천 테) 영역으로 여러 세션 재현 → term_corrections 단어가 모두 단어장에 자동 박제 → AI가 모두 제외 → **0건 박제 정합**.
+
+**본 영역 = 결함 X, 정상 동작**. 모델 영역 / 본 세션 fix 영역과 모두 무관.
+
+**검증 의무**: 다른 영상 (단어장에 없는 단어 박제 영역) 으로 검증 시 후보 박제 박제 가능.
+
+**잠재 개선 영역** (선택):
+- 단어장 일시 적용 안 함 옵션 (사용자 선택)
+- 단어장 confidence 영역 (약한 매칭만 제외, 강한 매칭만 적용)
+
